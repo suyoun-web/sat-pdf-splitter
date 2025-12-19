@@ -8,8 +8,10 @@ from PIL import Image
 st.set_page_config(page_title="SAT PDF → 문제별 PNG", layout="wide")
 
 MODULE_RE = re.compile(r"<\s*MODULE\s*(\d+)\s*>", re.IGNORECASE)
+
+# 꼬리말/머리말 힌트(문서에 반복 등장)
 HEADER_FOOTER_HINT_RE = re.compile(
-    r"(YOU,\s*GENIUS|Kakaotalk|Instagram|010-\d{3,4}-\d{4}|700\+\s*MOCK\s*TEST)",
+    r"(YOU,\s*GENIUS|700\+\s*MOCK\s*TEST|Kakaotalk|Instagram|010-\d{3,4}-\d{4})",
     re.IGNORECASE,
 )
 
@@ -57,6 +59,7 @@ def detect_question_anchors(page, left_ratio=0.25, max_line_chars=4):
         line_text = " ".join(t[4] for t in tokens).strip()
         compact = re.sub(r"\s+", "", line_text)
 
+        # 머리말/꼬리말 줄 제외
         if HEADER_FOOTER_HINT_RE.search(line_text):
             continue
         if len(compact) > max_line_chars:
@@ -110,7 +113,12 @@ def last_choice_bottom_y_in_band(page, y_from, y_to):
             return max(bottoms)
     return None
 
-def find_header_footer_cut_y(page, y_from, y_to):
+def find_footer_start_y(page, y_from, y_to):
+    """
+    현재 문제 구간(y_from~y_to) 안에서
+    꼬리말 힌트가 있는 텍스트 블록의 '시작 y'를 반환.
+    (있으면 그 위에서 잘라내기)
+    """
     ys = []
     for b in page.get_text("blocks"):
         if len(b) < 5:
@@ -206,7 +214,7 @@ def split_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12, frq_extra_space_px
     out = {1: {}, 2: {}}
     current_module = None
     side_pad_pt = SIDE_PAD_PX / zoom
-    frq_extra_pt = frq_extra_space_px / zoom  # px -> pt 근사
+    frq_extra_pt = frq_extra_space_px / zoom
 
     for pno in range(len(doc)):
         page = doc[pno]
@@ -236,23 +244,26 @@ def split_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12, frq_extra_space_px
                 y_cap = h
                 y_end = clamp(h - 8, y_start + 80, h)
 
+            # (1) 우선 꼬리말 캡을 적용: 이 아래로는 절대 포함하지 않음
+            footer_y = find_footer_start_y(page, y_start, y_cap)
+            if footer_y is not None and footer_y > y_start + 120:
+                y_cap = min(y_cap, footer_y - 4)
+                y_end = min(y_end, y_cap)
+
             mcq_last = last_choice_bottom_y_in_band(page, y_start, y_cap)
             is_frq = (mcq_last is None)
 
             if mcq_last is not None:
                 y_end = clamp(max(y_end, mcq_last + 18), y_start + 80, y_cap)
 
-            cut_y = find_header_footer_cut_y(page, y_start, y_end)
-            if cut_y is not None and cut_y > y_start + 220:
-                if mcq_last is None or cut_y > mcq_last + 30:
-                    y_end = clamp(cut_y - 6, y_start + 80, y_end)
-
+            # (2) 텍스트 기반 공백 축소(꼬리말 제외)
             bottom = content_bottom_y(page, y_start, y_end)
             if bottom is not None and bottom > y_start + 140:
                 if mcq_last is not None:
                     bottom = max(bottom, mcq_last + 10)
                 y_end = min(y_end, bottom + 14)
 
+            # (3) 좌우 1차: 텍스트 기준
             xb = text_x_bounds_in_band(page, y_start, y_end, min_len=2)
             if xb is None:
                 x0, x1 = 0, w
@@ -260,7 +271,7 @@ def split_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12, frq_extra_space_px
                 x0 = clamp(xb[0] - side_pad_pt, 0, w)
                 x1 = clamp(xb[1] + side_pad_pt, x0 + 80, w)
 
-            # 잉크 bbox로 좌우/하단 타이트 (그림/공백 해결)
+            # (4) 잉크 bbox(그림 포함)로 타이트: 단, y는 y_cap(꼬리말 위)까지만
             scan_clip = fitz.Rect(0, y_start, w, y_end)
             px_bbox = ink_bbox_by_raster(page, scan_clip)
             if px_bbox is not None:
@@ -273,7 +284,7 @@ def split_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12, frq_extra_space_px
                     new_y_end = max(new_y_end, mcq_last + 12)
                 y_end = clamp(new_y_end, y_start + 80, y_end)
 
-            # FRQ는 아래 여백을 추가로 확보(학생 풀이 공간)
+            # (5) FRQ 여백 추가(단, 꼬리말/다음 문제 시작 캡을 절대 넘지 않음)
             if is_frq:
                 y_end = min(y_cap, y_end + frq_extra_pt)
 
@@ -294,7 +305,7 @@ def make_zip(module_map, zip_base_name):
     buf.seek(0)
     return buf, zip_base_name + ".zip"
 
-st.title("SAT 수학 PDF → 문제별 PNG (FRQ 여백 포함)")
+st.title("SAT 수학 PDF → 문제별 PNG (꼬리말 제거 + FRQ 여백)")
 
 pdf = st.file_uploader("PDF 업로드", type=["pdf"])
 
