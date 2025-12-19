@@ -3,6 +3,7 @@ import io
 import zipfile
 import streamlit as st
 import fitz  # PyMuPDF
+from PIL import Image
 
 st.set_page_config(page_title="SAT PDF → 문제별 PNG", layout="wide")
 
@@ -12,14 +13,17 @@ HEADER_FOOTER_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# "21." 같은 토큰 / 또는 "21" + "." 결합을 처리
+# 문제 번호는 '21.' 토큰이거나 '21' '.' 분리일 수 있음
 NUMDOT_RE = re.compile(r"^(\d{1,2})\.$$")
-NUM_RE = re.compile(r"^\d{1,2}$")
+NUM_RE = re.compile(r"^\d{1,2}$$")
 
-# 보기 감지
 CHOICE_LABELS = ["D)", "C)", "B)", "A)"]
 
-SIDE_PAD_PX = 10
+# 크롭 설정
+SIDE_PAD_PX = 10          # 좌우 여백(px)
+INK_PAD_PX = 10           # 잉크 bbox 기준 패딩(px)
+SCAN_ZOOM = 0.6           # 잉크 bbox 찾는 저해상도 렌더 zoom
+WHITE_THRESH = 250        # 흰색 판정 임계값(0~255)
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
@@ -32,9 +36,8 @@ def find_module_on_page(page):
     mid = int(m.group(1))
     return mid if mid in (1, 2) else None
 
-def group_words_into_lines(words, y_tol=2.5):
+def group_words_into_lines(words):
     # words: (x0,y0,x1,y1,txt,block,line,word)
-    # line key = (block, line)
     lines = {}
     for w in words:
         x0,y0,x1,y1,txt,block_no,line_no,word_no = w
@@ -46,12 +49,8 @@ def group_words_into_lines(words, y_tol=2.5):
 
 def detect_question_anchors(page, left_ratio=0.25, max_line_chars=4):
     """
-    진짜 문제번호 라인만 잡기:
-    - 왼쪽에 있음
-    - 라인 텍스트가 거의 'n.' 단독(공백 제외 길이 max_line_chars 이하)
-    - 머리말/연락처 라인은 제외
-    - "n."이 하나의 토큰이거나, n과 '.'이 인접 토큰으로 분리된 경우도 처리
-    Returns: list of (qnum, y0)
+    '문제 속 숫자' 오탐 제거를 위해,
+    "거의 n. 단독 라인"만 문제 번호로 인정.
     """
     w_page = page.rect.width
     words = page.get_text("words")
@@ -62,7 +61,6 @@ def detect_question_anchors(page, left_ratio=0.25, max_line_chars=4):
     anchors = []
 
     for tokens in lines:
-        # tokens: [(x0,y0,x1,y1,txt), ...] sorted by x0
         line_text = " ".join(t[4] for t in tokens).strip()
         compact = re.sub(r"\s+", "", line_text)
 
@@ -70,7 +68,7 @@ def detect_question_anchors(page, left_ratio=0.25, max_line_chars=4):
         if HEADER_FOOTER_HINT_RE.search(line_text):
             continue
 
-        # 라인이 너무 길면 문제번호 단독 라인이 아닐 확률이 큼
+        # 라인이 길면 번호 단독 라인 아님
         if len(compact) > max_line_chars:
             continue
 
@@ -79,8 +77,10 @@ def detect_question_anchors(page, left_ratio=0.25, max_line_chars=4):
         if x_left > w_page * left_ratio:
             continue
 
-        # 케이스1: '21.' 토큰이 그대로 있음
         qnum = None
+        y_top = None
+
+        # 케이스1: '21.' 토큰 그대로
         for (x0,y0,x1,y1,txt) in tokens:
             m = NUMDOT_RE.match(txt)
             if m:
@@ -105,17 +105,21 @@ def detect_question_anchors(page, left_ratio=0.25, max_line_chars=4):
 
         anchors.append((qnum, y_top))
 
-    anchors.sort(key=lambda t: t[1])  # y 순
+    anchors.sort(key=lambda t: t[1])  # y순
     return anchors
 
+def band_text(page, clip):
+    return (page.get_text("text", clip=clip) or "")
+
 def last_choice_bottom_y_in_band(page, y_from, y_to):
-    # 현재 문제 band 내부에서만 마지막 보기 위치 찾기(없으면 None)
+    # 현재 문제 y구간 내부에서만 마지막 보기 위치 탐색(없으면 None)
     clip = fitz.Rect(0, y_from, page.rect.width, y_to)
-    t = (page.get_text("text", clip=clip) or "")
+    t = band_text(page, clip)
     if "A)" not in t:
         return None
+
     for lab in CHOICE_LABELS:
-        rects = page.search_for(lab)  # 페이지 전체지만, y band로 필터
+        rects = page.search_for(lab)
         bottoms = [r.y1 for r in rects if (r.y1 >= y_from and r.y0 <= y_to)]
         if bottoms:
             return max(bottoms)
@@ -163,10 +167,55 @@ def text_x_bounds_in_band(page, y_from, y_to, min_len=2):
             continue
         if HEADER_FOOTER_HINT_RE.search(t):
             continue
-        xs0.append(x0); xs1.append(x1)
+        xs0.append(x0)
+        xs1.append(x1)
     if not xs0:
         return None
     return min(xs0), max(xs1)
+
+def ink_bbox_by_raster(page, clip, scan_zoom=SCAN_ZOOM, white_thresh=WHITE_THRESH):
+    """
+    clip 영역을 저해상도로 렌더링 후 잉크(흰색 아닌 픽셀) bbox를 찾는다.
+    반환: (minx, miny, maxx, maxy, w, h) or None  (px 좌표)
+    """
+    mat = fitz.Matrix(scan_zoom, scan_zoom)
+    pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+    w, h = img.size
+    px = img.load()
+
+    minx, miny = w, h
+    maxx, maxy = -1, -1
+
+    step = 2  # 속도/정확도 트레이드오프
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            r, g, b = px[x, y]
+            if r < white_thresh or g < white_thresh or b < white_thresh:
+                if x < minx: minx = x
+                if y < miny: miny = y
+                if x > maxx: maxx = x
+                if y > maxy: maxy = y
+
+    if maxx < 0:
+        return None
+    return (minx, miny, maxx, maxy, w, h)
+
+def px_bbox_to_page_rect(clip, px_bbox, pad_px=INK_PAD_PX):
+    minx, miny, maxx, maxy, w, h = px_bbox
+
+    minx = max(0, minx - pad_px)
+    miny = max(0, miny - pad_px)
+    maxx = min(w - 1, maxx + pad_px)
+    maxy = min(h - 1, maxy + pad_px)
+
+    # px -> page 좌표 변환(clip 내부 선형)
+    x0 = clip.x0 + (minx / (w - 1)) * (clip.x1 - clip.x0)
+    x1 = clip.x0 + (maxx / (w - 1)) * (clip.x1 - clip.x0)
+    y0 = clip.y0 + (miny / (h - 1)) * (clip.y1 - clip.y0)
+    y1 = clip.y0 + (maxy / (h - 1)) * (clip.y1 - clip.y0)
+    return fitz.Rect(x0, y0, x1, y1)
 
 def render_png(page, clip, zoom):
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
@@ -200,36 +249,53 @@ def split_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12):
 
             if i + 1 < len(anchors):
                 next_y = anchors[i + 1][1]
-                y_cap = clamp(next_y - 1, 0, h)
+                y_cap = clamp(next_y - 1, 0, h)  # 다음 문제로는 절대 넘어가지 않음
                 y_end = clamp(next_y - pad_bottom, y_start + 80, y_cap)
             else:
                 y_cap = h
                 y_end = clamp(h - 8, y_start + 80, h)
 
-            # MCQ면 보기 마지막(D/C/B/A)까지는 반드시 포함(단, 다음 문제로는 절대 안 감)
+            # MCQ면 보기 마지막까지는 최소 포함(다음 문제로는 절대 안 감)
             mcq_last = last_choice_bottom_y_in_band(page, y_start, y_cap)
             if mcq_last is not None:
                 y_end = clamp(max(y_end, mcq_last + 18), y_start + 80, y_cap)
 
-            # 머리말 컷: 보기보다 위로는 절대 자르지 않음
+            # 머리말 컷: 보기보다 위로는 자르지 않음
             cut_y = find_header_footer_cut_y(page, y_start, y_end)
             if cut_y is not None and cut_y > y_start + 220:
                 if mcq_last is None or cut_y > mcq_last + 30:
                     y_end = clamp(cut_y - 6, y_start + 80, y_end)
 
-            # 공백 줄이기(보기 보호)
+            # 공백 줄이기(텍스트 기반 1차)
             bottom = content_bottom_y(page, y_start, y_end)
             if bottom is not None and bottom > y_start + 140:
                 if mcq_last is not None:
                     bottom = max(bottom, mcq_last + 10)
                 y_end = min(y_end, bottom + 14)
 
+            # 좌우 1차(텍스트 기준) + 10px
             xb = text_x_bounds_in_band(page, y_start, y_end, min_len=2)
             if xb is None:
                 x0, x1 = 0, w
             else:
                 x0 = clamp(xb[0] - side_pad_pt, 0, w)
                 x1 = clamp(xb[1] + side_pad_pt, x0 + 80, w)
+
+            # 2차(결정타): 잉크 bbox로 좌우/하단을 타이트하게 (그림/표/공백 문제 해결)
+            scan_clip = fitz.Rect(0, y_start, w, y_end)
+            px_bbox = ink_bbox_by_raster(page, scan_clip)
+            if px_bbox is not None:
+                tight = px_bbox_to_page_rect(scan_clip, px_bbox, pad_px=INK_PAD_PX)
+
+                # 번호 포함을 위해 y_start는 유지, x는 tight로, y_end는 tight.y1로 축소(단 최소 높이 보장)
+                x0 = clamp(tight.x0, 0, w)
+                x1 = clamp(tight.x1, x0 + 80, w)
+
+                # 아래쪽은 타이트하게 줄이되, MCQ 보기 마지막보다 위로는 못 올라가게
+                new_y_end = clamp(tight.y1, y_start + 80, y_end)
+                if mcq_last is not None:
+                    new_y_end = max(new_y_end, mcq_last + 12)
+                y_end = clamp(new_y_end, y_start + 80, y_end)
 
             clip = fitz.Rect(x0, y_start, x1, y_end)
             out[current_module][qnum] = render_png(page, clip, zoom)
@@ -248,13 +314,14 @@ def make_zip(module_map, zip_base_name):
     buf.seek(0)
     return buf, zip_base_name + ".zip"
 
-st.title("SAT 수학 PDF → 문제별 PNG (문제 속 숫자 오탐 제거 버전)")
+st.title("SAT 수학 PDF → 문제별 PNG (M1/M2 폴더, 1..22, 타이트 크롭)")
 
 pdf = st.file_uploader("PDF 업로드", type=["pdf"])
+
 col1, col2, col3 = st.columns(3)
 zoom = col1.slider("해상도(zoom)", 2.0, 4.0, 3.0, 0.1)
-pad_top = col2.slider("위 여백(번호 포함)", 0, 120, 10, 1)
-pad_bottom = col3.slider("아래 여백", 0, 160, 12, 1)
+pad_top = col2.slider("위 여백(번호 포함)", 0, 140, 10, 1)
+pad_bottom = col3.slider("아래 여백", 0, 200, 12, 1)
 
 if pdf is None:
     st.stop()
@@ -263,7 +330,7 @@ pdf_name = pdf.name
 zip_base = pdf_name[:-4] if pdf_name.lower().endswith(".pdf") else pdf_name
 
 if st.button("생성 & ZIP 다운로드"):
-    with st.spinner("자르는 중..."):
+    with st.spinner("문제별로 자르는 중..."):
         module_map = split_pdf(pdf.read(), zoom=zoom, pad_top=pad_top, pad_bottom=pad_bottom)
 
     st.success(f"완료: M1 {len(module_map.get(1, {}))}개, M2 {len(module_map.get(2, {}))}개")
