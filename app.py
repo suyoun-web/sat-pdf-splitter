@@ -17,6 +17,7 @@ NUMDOT_RE = re.compile(r"^(\d{1,2})\.$$")
 NUM_RE = re.compile(r"^\d{1,2}$$")
 CHOICE_LABELS = ["D)", "C)", "B)", "A)"]
 
+# Cropping settings
 SIDE_PAD_PX = 10
 INK_PAD_PX = 10
 SCAN_ZOOM = 0.6
@@ -36,9 +37,9 @@ def find_module_on_page(page):
 def group_words_into_lines(words):
     lines = {}
     for w in words:
-        x0,y0,x1,y1,txt,block_no,line_no,word_no = w
+        x0, y0, x1, y1, txt, block_no, line_no, word_no = w
         key = (block_no, line_no)
-        lines.setdefault(key, []).append((x0,y0,x1,y1,txt))
+        lines.setdefault(key, []).append((x0, y0, x1, y1, txt))
     for k in lines:
         lines[k].sort(key=lambda t: t[0])
     return list(lines.values())
@@ -48,15 +49,23 @@ def detect_question_anchors(page, left_ratio=0.25, max_line_chars=4):
     words = page.get_text("words")
     if not words:
         return []
+
     lines = group_words_into_lines(words)
     anchors = []
+
     for tokens in lines:
         line_text = " ".join(t[4] for t in tokens).strip()
         compact = re.sub(r"\s+", "", line_text)
+
+        # exclude header/footer lines
         if HEADER_FOOTER_HINT_RE.search(line_text):
             continue
+
+        # ensure nearly "n." only
         if len(compact) > max_line_chars:
             continue
+
+        # ensure near left margin
         x_left = min(t[0] for t in tokens)
         if x_left > w_page * left_ratio:
             continue
@@ -64,17 +73,19 @@ def detect_question_anchors(page, left_ratio=0.25, max_line_chars=4):
         qnum = None
         y_top = None
 
-        for (x0,y0,x1,y1,txt) in tokens:
+        # case 1: "21."
+        for (x0, y0, x1, y1, txt) in tokens:
             m = NUMDOT_RE.match(txt)
             if m:
                 qnum = int(m.group(1))
                 y_top = y0
                 break
 
+        # case 2: "21" "."
         if qnum is None:
-            for i in range(len(tokens)-1):
+            for i in range(len(tokens) - 1):
                 t1 = tokens[i][4]
-                t2 = tokens[i+1][4]
+                t2 = tokens[i + 1][4]
                 if NUM_RE.match(t1) and t2 == ".":
                     qnum = int(t1)
                     y_top = tokens[i][1]
@@ -123,7 +134,7 @@ def content_bottom_y(page, y_from, y_to):
     for b in page.get_text("blocks"):
         if len(b) < 5:
             continue
-        y0,y1,text = b[1], b[3], b[4]
+        y0, y1, text = b[1], b[3], b[4]
         if y1 < y_from or y0 > y_to:
             continue
         if text and HEADER_FOOTER_HINT_RE.search(str(text)):
@@ -137,7 +148,7 @@ def text_x_bounds_in_band(page, y_from, y_to, min_len=2):
     for b in page.get_text("blocks"):
         if len(b) < 5:
             continue
-        x0,y0,x1,y1,text = b[0],b[1],b[2],b[3],b[4]
+        x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4]
         if y1 < y_from or y0 > y_to:
             continue
         if not text:
@@ -194,20 +205,18 @@ def render_png(page, clip, zoom):
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
     return pix.tobytes("png")
 
-def expand_rect_to_width(rect, target_width, page_width):
+def expand_rect_to_width_right_only(rect, target_width, page_width):
     cur = rect.width
     if cur >= target_width:
         return rect
-    extra = target_width - cur
-    left = rect.x0 - extra / 2
-    right = rect.x1 + extra / 2
-    left = clamp(left, 0, page_width)
-    right = clamp(right, left + 80, page_width)
-    return fitz.Rect(left, rect.y0, right, rect.y1)
+    new_x0 = rect.x0
+    new_x1 = rect.x0 + target_width
+    new_x1 = clamp(new_x1, new_x0 + 80, page_width)
+    return fitz.Rect(new_x0, rect.y0, new_x1, rect.y1)
 
 def compute_rects_for_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12, frq_extra_space_px=250):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    rects = []  # list of dict: {mod,qnum,page_index,rect}
+    rects = []  # {mod,qnum,page,rect,page_width}
     current_module = None
 
     side_pad_pt = SIDE_PAD_PX / zoom
@@ -238,6 +247,7 @@ def compute_rects_for_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12, frq_ex
                 y_cap = h
                 y_end = clamp(h - 8, y_start + 80, h)
 
+            # Footer cap (remove footer)
             footer_y = find_footer_start_y(page, y_start, y_cap)
             if footer_y is not None and footer_y > y_start + 120:
                 y_cap = min(y_cap, footer_y - 4)
@@ -262,6 +272,7 @@ def compute_rects_for_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12, frq_ex
                 x0 = clamp(xb[0] - side_pad_pt, 0, w)
                 x1 = clamp(xb[1] + side_pad_pt, x0 + 80, w)
 
+            # Ink bbox tighten for figure/blank handling
             scan_clip = fitz.Rect(0, y_start, w, y_end)
             px_bbox = ink_bbox_by_raster(page, scan_clip)
             if px_bbox is not None:
@@ -274,6 +285,7 @@ def compute_rects_for_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12, frq_ex
                     new_y_end = max(new_y_end, mcq_last + 12)
                 y_end = clamp(new_y_end, y_start + 80, y_end)
 
+            # FRQ extra writing space (but never beyond cap)
             if is_frq:
                 y_end = min(y_cap, y_end + frq_extra_pt)
 
@@ -287,20 +299,20 @@ def compute_rects_for_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12, frq_ex
 
     return doc, rects
 
-def make_zip_from_rects(doc, rects, zoom, zip_base_name, unify_width=True):
-    # 모듈별 최대 폭 계산
+def make_zip_from_rects(doc, rects, zoom, zip_base_name, unify_width_right=True):
+    # module-wise max width
     maxw = {1: 0.0, 2: 0.0}
-    if unify_width:
-        for r in rects:
-            maxw[r["mod"]] = max(maxw[r["mod"]], r["rect"].width)
+    for r in rects:
+        maxw[r["mod"]] = max(maxw[r["mod"]], r["rect"].width)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for r in rects:
             page = doc[r["page"]]
             rect = r["rect"]
-            if unify_width and maxw.get(r["mod"], 0) > 0:
-                rect = expand_rect_to_width(rect, maxw[r["mod"]], r["page_width"])
+
+            if unify_width_right and maxw.get(r["mod"], 0) > 0:
+                rect = expand_rect_to_width_right_only(rect, maxw[r["mod"]], r["page_width"])
 
             png = render_png(page, rect, zoom)
             z.writestr(f"M{r['mod']}/{r['qnum']}.png", png)
@@ -308,7 +320,7 @@ def make_zip_from_rects(doc, rects, zoom, zip_base_name, unify_width=True):
     buf.seek(0)
     return buf, zip_base_name + ".zip"
 
-st.title("SAT 수학 PDF → 문제별 PNG (꼬리말 제거 + FRQ 여백 + 모듈별 가로폭 통일)")
+st.title("SAT 수학 PDF → 문제별 PNG (최종)")
 
 pdf = st.file_uploader("PDF 업로드", type=["pdf"])
 
@@ -318,7 +330,7 @@ pad_top = col2.slider("위 여백(번호 포함)", 0, 140, 10, 1)
 pad_bottom = col3.slider("아래 여백(다음 문제 전)", 0, 200, 12, 1)
 frq_space = col4.slider("FRQ 아래 여백(px)", 0, 600, 250, 25)
 
-unify_width = st.checkbox("모듈 내 가로폭을 가장 넓은 문제에 맞춤", value=True)
+unify_width_right = st.checkbox("모듈 내 가로폭을 가장 넓은 문제에 맞춤(오른쪽만 확장)", value=True)
 
 if pdf is None:
     st.stop()
@@ -335,6 +347,12 @@ if st.button("생성 & ZIP 다운로드"):
             pad_bottom=pad_bottom,
             frq_extra_space_px=frq_space,
         )
-        zbuf, zip_filename = make_zip_from_rects(doc, rects, zoom, zip_base, unify_width=unify_width)
+        zbuf, zip_filename = make_zip_from_rects(
+            doc,
+            rects,
+            zoom,
+            zip_base,
+            unify_width_right=unify_width_right,
+        )
 
     st.download_button("ZIP 다운로드", data=zbuf, file_name=zip_filename, mime="application/zip")
