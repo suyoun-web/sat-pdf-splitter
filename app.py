@@ -6,12 +6,9 @@ import fitz  # PyMuPDF
 
 st.set_page_config(page_title="SAT PDF → 모듈별 문제 이미지", layout="wide")
 
-# 문제 번호 토큰: "1." "2." ...
 QNUM_RE = re.compile(r"^\s*(\d{1,3})\.\s*$$")
-# 모듈 표기: "<MODULE1>", "<MODULE2>"
 MODULE_RE = re.compile(r"^<\s*MODULE\s*(\d+)\s*>$$", re.IGNORECASE)
 
-# PDF 내 반복 머리말/연락처(발췌에도 실제 존재) 잘라내기 힌트
 FOOTER_HINT_RE = re.compile(
     r"(YOU,\s*GENIUS|Kakaotalk|Instagram|010-\d{3,4}-\d{4})",
     re.IGNORECASE,
@@ -21,10 +18,6 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 def extract_module_id(page):
-    """
-    page.get_text("blocks")는 보통 (x0,y0,x1,y1,text,block_no,block_type,...) 튜플 리스트.
-    starred unpacking을 쓰지 않고 안전하게 인덱싱한다.
-    """
     blocks = page.get_text("blocks")
     for b in blocks:
         if len(b) < 5:
@@ -35,8 +28,7 @@ def extract_module_id(page):
         for line in str(text).splitlines():
             m = MODULE_RE.match(line.strip())
             if m:
-                mid = int(m.group(1))
-                return mid
+                return int(m.group(1))
     return None
 
 def find_footer_cut_y(page, y_from, y_to):
@@ -45,7 +37,7 @@ def find_footer_cut_y(page, y_from, y_to):
     for b in blocks:
         if len(b) < 5:
             continue
-        x0, y0, x1, y1 = b[0], b[1], b[2], b[3]
+        y0 = b[1]
         text = b[4]
         if y0 < y_from or y0 > y_to:
             continue
@@ -64,19 +56,19 @@ def split_pdf(pdf_bytes, zoom=2.8, pad_x=14, pad_top=6, pad_bottom=10, top_exclu
 
     for pno in range(len(doc)):
         page = doc[pno]
-        w, h = page.rect.width, page.rect.height
+        w = page.rect.width
+        h = page.rect.height
 
         mid = extract_module_id(page)
         if mid in (1, 2):
             current_module = mid
 
-        # 단어 단위 추출: (x0,y0,x1,y1,"word", block_no, line_no, word_no)
         words = page.get_text("words")
         words.sort(key=lambda t: (t[1], t[0]))  # y, x
 
         starts = []
-        for (x0, y0, x1, y1, txt, *_) in words:
-            # 페이지 맨 위 머리말 영역에서 잡히는 숫자를 줄이기 위해 상단 일부 제외
+        for item in words:
+            x0, y0, x1, y1, txt = item[0], item[1], item[2], item[3], item[4]
             if y0 < top_exclude_ratio * h:
                 continue
             if QNUM_RE.match(txt):
@@ -89,20 +81,24 @@ def split_pdf(pdf_bytes, zoom=2.8, pad_x=14, pad_top=6, pad_bottom=10, top_exclu
 
         for i, (y0, txt) in enumerate(starts):
             if current_module not in (1, 2):
-                # 모듈 판정 전이면 스킵 (당신 PDF는 <MODULE1>, <MODULE2>가 있으니 보통 안 걸림)
                 continue
 
-            qnum = int(re.sub(r"\D", "", txt))
+            qnum_txt = re.sub(r"\D", "", txt)
+            if not qnum_txt:
+                continue
+            qnum = int(qnum_txt)
             if not (1 <= qnum <= 22):
                 continue
 
             y_start = clamp(y0 - pad_top, 0, h)
 
-            # 기본 끝: 다음 문제 번호 직전, 마지막이면 페이지 끝 근처
-            y_end_default = (starts[i + 1][0] - pad_bottom) if i + 1 < len(starts) else (h - 10)
+            if i + 1 < len(starts):
+                y_end_default = starts[i + 1][0] - pad_bottom
+            else:
+                y_end_default = h - 10
+
             y_end_default = clamp(y_end_default, y_start + 5, h)
 
-            # 문제 끝 구간에 반복 머리말이 섞이면 그 위에서 컷
             footer_cut_y = find_footer_cut_y(page, y_start, y_end_default)
             y_end = y_end_default
             if footer_cut_y is not None and footer_cut_y > y_start + 20:
@@ -112,19 +108,13 @@ def split_pdf(pdf_bytes, zoom=2.8, pad_x=14, pad_top=6, pad_bottom=10, top_exclu
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
             png_bytes = pix.tobytes("png")
 
-            # 같은 번호가 중복 감지되면 첫 번째 유지(이상 케이스 방어)
-            out[current_module].setdefault(qnum, png_bytes)
+            # 중복 방지: 같은 번호는 최초 1개만
+            if qnum not in out[current_module]:
+                out[current_module][qnum] = png_bytes
 
     return out
 
 def build_zip(module_map, zip_base_name):
-    """
-    ZIP 내부:
-      M1/1.png ... M1/22.png
-      M2/1.png ... M2/22.png
-    ZIP 파일명:
-      업로드 PDF 이름과 동일한 베이스명 + .zip
-    """
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for mod in (1, 2):
@@ -167,7 +157,6 @@ if st.button("생성 & ZIP 다운로드 준비"):
     c2 = len(module_map.get(2, {}))
     st.success(f"완료: M1 {c1}개, M2 {c2}개 (각 최대 22개)")
 
-    # 누락 번호 표시(원인 파악에 도움)
     miss1 = [n for n in range(1, 23) if n not in module_map.get(1, {})]
     miss2 = [n for n in range(1, 23) if n not in module_map.get(2, {})]
     with st.expander("누락된 번호 보기(문제가 안 잘렸을 때 확인용)"):
@@ -181,4 +170,3 @@ if st.button("생성 & ZIP 다운로드 준비"):
         file_name=zip_filename,
         mime="application/zip",
     )
-``_
