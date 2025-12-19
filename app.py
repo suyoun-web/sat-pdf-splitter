@@ -4,7 +4,7 @@ import zipfile
 import streamlit as st
 import fitz  # PyMuPDF
 
-st.set_page_config(page_title="SAT PDF → 문제별 PNG(텍스트 기준 타이트)", layout="wide")
+st.set_page_config(page_title="SAT PDF → 문제별 PNG", layout="wide")
 
 MODULE_RE = re.compile(r"<\s*MODULE\s*(\d+)\s*>", re.IGNORECASE)
 HEADER_FOOTER_HINT_RE = re.compile(
@@ -12,8 +12,11 @@ HEADER_FOOTER_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 본문 힌트(번호 오른쪽에 따라오는지 검증)
+BODY_HINT_RE = re.compile(r"\b(The|In the|If|Which|What|A circle|The graph)\b", re.IGNORECASE)
+
 X_MAX_RATIO = 0.35
-SIDE_PAD_PX = 10  # ← 5에서 10으로 변경
+SIDE_PAD_PX = 10
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
@@ -26,19 +29,45 @@ def find_module_on_page(page):
     mid = int(m.group(1))
     return mid if mid in (1, 2) else None
 
-def pick_leftmost_rect(rects):
-    rects = sorted(rects, key=lambda r: (r.x0, r.y0))
-    return rects[0] if rects else None
+def band_text(page, clip):
+    # clip 영역 텍스트만 가져오기
+    return (page.get_text("text", clip=clip) or "").strip()
 
-def find_num_y(page, n):
+def pick_best_num_rect(page, n):
     rects = page.search_for(f"{n}.")
     if not rects:
         return None
+
     w = page.rect.width
+    # 1) 왼쪽 영역 필터
     rects = [r for r in rects if r.x0 <= w * X_MAX_RATIO]
     if not rects:
         return None
-    return pick_leftmost_rect(rects).y0
+
+    # 2) “진짜 번호” 검증: 번호 근처에 본문/보기 존재?
+    scored = []
+    for r in rects:
+        y0 = r.y0
+        # 번호 오른쪽/아래 작은 영역을 검사
+        probe = fitz.Rect(r.x0, y0, w, min(page.rect.height, y0 + 110))
+        t = band_text(page, probe)
+        # 보기 A) 또는 본문 힌트가 있으면 강하게 점수
+        score = 0
+        if "A)" in t:
+            score += 3
+        if BODY_HINT_RE.search(t):
+            score += 2
+        # 너무 짧으면 감점(문제 속 4. 같은 것)
+        if len(re.sub(r"\s+", " ", t)) < 20:
+            score -= 2
+        scored.append((score, r.x0, r.y0, r))
+
+    scored.sort(key=lambda x: (-x[0], x[1], x[2]))  # score desc, x asc, y asc
+    best = scored[0]
+    # 점수가 너무 낮으면(오탐 가능) 아예 None 처리
+    if best[0] < 1:
+        return None
+    return best[3]
 
 def find_header_footer_cut_y(page, y_from, y_to):
     ys = []
@@ -85,10 +114,24 @@ def text_x_bounds_in_band(page, y_from, y_to, min_len=2):
             continue
         xs0.append(x0)
         xs1.append(x1)
-
     if not xs0:
         return None
     return min(xs0), max(xs1)
+
+def last_choice_bottom_y(page, y_from, y_to):
+    # y구간 안에서만 마지막 보기(A/B/C/D) 위치 찾기
+    # A)가 없으면 MCQ로 보지 않음
+    clip = fitz.Rect(0, y_from, page.rect.width, y_to)
+    t = band_text(page, clip)
+    if "A)" not in t:
+        return None
+
+    for label in ["D)", "C)", "B)", "A)"]:
+        rects = page.search_for(label)
+        bottoms = [r.y1 for r in rects if (r.y1 >= y_from and r.y0 <= y_to)]
+        if bottoms:
+            return max(bottoms)
+    return None
 
 def render_png(page, clip, zoom):
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
@@ -98,7 +141,6 @@ def split_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out = {1: {}, 2: {}}
     current_module = None
-
     side_pad_pt = SIDE_PAD_PX / zoom
 
     for pno in range(len(doc)):
@@ -113,9 +155,9 @@ def split_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12):
 
         found = []
         for n in range(1, 23):
-            y = find_num_y(page, n)
-            if y is not None:
-                found.append((n, y))
+            r = pick_best_num_rect(page, n)
+            if r is not None:
+                found.append((n, r.y0))
         if not found:
             continue
 
@@ -128,25 +170,38 @@ def split_pdf(pdf_bytes, zoom=3.0, pad_top=10, pad_bottom=12):
             y_start = clamp(y0 - pad_top, 0, h)
 
             if i + 1 < len(found):
-                y_end = found[i + 1][1] - pad_bottom
+                next_y = found[i + 1][1]
+                y_cap = clamp(next_y - 1, 0, h)   # 절대 다음 문제로는 안 감
+                y_end = clamp(next_y - pad_bottom, y_start + 80, y_cap)
             else:
-                y_end = h - 8
-            y_end = clamp(y_end, y_start + 80, h)
+                y_cap = h
+                y_end = clamp(h - 8, y_start + 80, h)
 
+            # MCQ면 보기 마지막 위치를 먼저 확보 (D) 잘림 방지)
+            mcq_last = last_choice_bottom_y(page, y_start, y_cap)
+            if mcq_last is not None:
+                y_end = clamp(max(y_end, mcq_last + 18), y_start + 80, y_cap)
+
+            # 머리말 컷: 단, MCQ 보기가 있으면 보기 위로는 절대 자르지 않음
             cut_y = find_header_footer_cut_y(page, y_start, y_end)
             if cut_y is not None and cut_y > y_start + 220:
-                y_end = clamp(cut_y - 6, y_start + 80, y_end)
+                if mcq_last is None or cut_y > mcq_last + 30:
+                    y_end = clamp(cut_y - 6, y_start + 80, y_end)
 
+            # 공백 축소(보기는 보호)
             bottom = content_bottom_y(page, y_start, y_end)
             if bottom is not None and bottom > y_start + 140:
+                if mcq_last is not None:
+                    bottom = max(bottom, mcq_last + 10)
                 y_end = min(y_end, bottom + 14)
 
+            # 좌우(텍스트 기준) + 10px
             xb = text_x_bounds_in_band(page, y_start, y_end, min_len=2)
             if xb is None:
                 x0, x1 = 0, w
             else:
                 x0 = clamp(xb[0] - side_pad_pt, 0, w)
-                x1 = clamp(xb[1] + side_pad_pt, x0 + 80, w)  # ← 최소 폭도 상향
+                x1 = clamp(xb[1] + side_pad_pt, x0 + 80, w)
 
             clip = fitz.Rect(x0, y_start, x1, y_end)
             out[current_module][n] = render_png(page, clip, zoom)
@@ -165,10 +220,9 @@ def make_zip(module_map, zip_base_name):
     buf.seek(0)
     return buf, zip_base_name + ".zip"
 
-st.title("SAT 수학 PDF → 문제별 PNG (텍스트 기준 좌우 10px)")
+st.title("SAT 수학 PDF → 문제별 PNG (번호 오탐 방지 + MCQ 보기 보호 + 좌우 10px)")
 
 pdf = st.file_uploader("PDF 업로드", type=["pdf"])
-
 col1, col2, col3 = st.columns(3)
 zoom = col1.slider("해상도(zoom)", 2.0, 4.0, 3.0, 0.1)
 pad_top = col2.slider("위 여백(번호 포함)", 0, 120, 10, 1)
@@ -182,12 +236,7 @@ zip_base = pdf_name[:-4] if pdf_name.lower().endswith(".pdf") else pdf_name
 
 if st.button("생성 & ZIP 다운로드"):
     with st.spinner("자르는 중..."):
-        module_map = split_pdf(
-            pdf.read(),
-            zoom=zoom,
-            pad_top=pad_top,
-            pad_bottom=pad_bottom,
-        )
+        module_map = split_pdf(pdf.read(), zoom=zoom, pad_top=pad_top, pad_bottom=pad_bottom)
 
     st.success(f"완료: M1 {len(module_map.get(1, {}))}개, M2 {len(module_map.get(2, {}))}개")
     zbuf, zip_filename = make_zip(module_map, zip_base)
