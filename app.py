@@ -2,8 +2,8 @@
 # =========================================================
 # YOU, GENIUS SAT MATH Problem Bank App
 # 1) PDF -> unit-code PNG ZIP
-# 2) ZIP -> Google Drive upload + Google Sheet DB build
-# 3) Student remedial packet PDF generation
+# 2) Student remedial packet PDF generation
+#    - No automatic ZIP upload tab. Upload images to Drive manually, then Sheet1 DB is read-only.
 # =========================================================
 
 import io
@@ -11,6 +11,7 @@ import re
 import csv
 import random
 import zipfile
+import hmac
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 
@@ -41,7 +42,9 @@ from reportlab.pdfbase.ttfonts import TTFont
 # =========================================================
 st.set_page_config(page_title="YOU, GENIUS SAT MATH 문제은행", layout="wide")
 
-APP_TITLE = "YOU, GENIUS SAT MATH 문제은행 & 보충 PACKET"
+APP_TITLE = "YOU, GENIUS SAT MATH 보충 PACKET"
+APP_ACCESS_CODE_SECRET_KEY = "access_code"
+DEFAULT_ACCESS_CODE = "110729"
 DEFAULT_SHEET_ID = "1qJSe8HX6mAQ8nKnnhfzz2PT-ycjM7W6kBsK6n9xZ3pY"
 DB_SHEET_NAME = "Sheet1"
 ROSTER_SHEET_NAME = "Sheet2"
@@ -128,20 +131,14 @@ HEADER_FOOTER_HINT_RE = re.compile(
 )
 NUMDOT_RE = re.compile(r"^(\d{1,4})\.$")
 NUM_RE = re.compile(r"^\d{1,4}$")
-# This problem-bank PDF uses real problem anchors like: 12. [Example ...]
-# Requiring the bracket prevents false anchors from section headings (1. Linear)
-# and numeric answer choices (1., 2., 3., 4.).
-QUESTION_START_RE = re.compile(r"^\s*(\d{1,4})\s*\.\s*\[")
-CHOICE_LABELS = [
-    "H)", "G)", "F)", "E)", "D)", "C)", "B)", "A)",
-    "(H)", "(G)", "(F)", "(E)", "(D)", "(C)", "(B)", "(A)",
-    # Some source questions use numbered choices instead of A-D.
-    "4.", "3.", "2.", "1.",
-]
-SECTION_BREAK_RE = re.compile(
-    r"^\s*(※|겨울\s*개념반|개념반/중급반|추가문항)",
-    re.IGNORECASE,
-)
+# In this problem-bank PDF, real problem anchors look like:
+#   1. [Example ...]
+#   9. [개념반 Example ...]
+#   45. [중급반 Example ...]
+# This prevents false cuts at unit headings like "1. Linear",
+# numbered choices like "1.", "2.", and wrapped text like "8. What ...".
+QUESTION_ANCHOR_HINT_RE = re.compile(r"\[.*?Example", re.IGNORECASE)
+CHOICE_LABELS = ["D)", "C)", "B)", "A)", "(D)", "(C)", "(B)", "(A)"]
 
 SIDE_PAD_PX = 10
 INK_PAD_PX = 10
@@ -162,6 +159,56 @@ def safe_sheet_id() -> str:
         return str(st.secrets.get("sheet_id", DEFAULT_SHEET_ID)).strip()
     except Exception:
         return DEFAULT_SHEET_ID
+
+
+def get_access_code() -> str:
+    """Read the entry code from Streamlit Secrets if provided.
+
+    Optional Streamlit Secrets override:
+        access_code = "110729"
+
+    If no access_code is set in Secrets, the app uses DEFAULT_ACCESS_CODE.
+    """
+    try:
+        code = str(st.secrets.get(APP_ACCESS_CODE_SECRET_KEY, DEFAULT_ACCESS_CODE)).strip()
+    except Exception:
+        code = DEFAULT_ACCESS_CODE
+    return code
+
+
+def require_access_code() -> None:
+    """Stop the app until the correct 6-digit entry code is entered."""
+    if st.session_state.get("access_code_ok", False):
+        return
+
+    st.title(APP_TITLE)
+    st.subheader("🔐 입장 코드 입력")
+    st.write("패킷을 만들려면 먼저 6자리 입장 코드를 입력해줘.")
+
+    entered_code = st.text_input(
+        "입장 코드",
+        type="password",
+        max_chars=6,
+        placeholder="6자리 숫자",
+        key="packet_access_code_input",
+    )
+    submit = st.button("입장", type="primary")
+
+    if submit:
+        expected_code = get_access_code()
+        if hmac.compare_digest(str(entered_code).strip(), expected_code):
+            st.session_state["access_code_ok"] = True
+            st.rerun()
+        else:
+            st.error("입장 코드가 맞지 않아요.")
+
+    st.stop()
+
+
+def logout_button() -> None:
+    if st.sidebar.button("나가기 / 코드 초기화"):
+        st.session_state["access_code_ok"] = False
+        st.rerun()
 
 
 def folder_display_name(code: str, unit_name: str) -> str:
@@ -558,19 +605,13 @@ def group_words_into_lines(words):
     return list(lines.values())
 
 
-def detect_question_anchors(page, left_ratio=0.28, max_line_chars=8, require_bracket_after_number=True):
-    """
-    Detect only real problem starts.
-
-    For this problem-bank PDF, real starts look like:
-        13. [개념반 Example 1.1-8)]
-        35. [Example 1.3-35)]
-
-    Requiring '[' after the printed number prevents false crops from:
-    - section titles like "1. Linear", "2. Percent & Unit conversion", "3. Quadratic"
-    - numbered answer choices like "1.", "2.", "3.", "4."
-    - wrapped sentences that begin a new line with something like "8. What is ..."
-    """
+def detect_question_anchors(
+    page,
+    left_ratio=0.28,
+    max_line_chars=8,
+    allow_inline_question_text=True,
+    require_example_anchor=True,
+):
     w_page = page.rect.width
     h_page = page.rect.height
     words = page.get_text("words")
@@ -589,6 +630,13 @@ def detect_question_anchors(page, left_ratio=0.28, max_line_chars=8, require_bra
         if HEADER_FOOTER_HINT_RE.search(line_text):
             continue
 
+        # For the unit-code problem-bank PDFs, require the actual problem-start pattern.
+        # Without this, the detector mistakes unit titles ("1. Linear"),
+        # numbered answer choices ("1.", "2."), and wrapped text ("8. What ...")
+        # for separate questions.
+        if require_example_anchor and not QUESTION_ANCHOR_HINT_RE.search(line_text):
+            continue
+
         x_left = min(t[0] for t in tokens)
         y_top = min(t[1] for t in tokens)
         if x_left > w_page * left_ratio:
@@ -597,37 +645,29 @@ def detect_question_anchors(page, left_ratio=0.28, max_line_chars=8, require_bra
             continue
 
         qnum = None
-        after_index = None
 
         # Case 1: first token is "125."
         m = NUMDOT_RE.match(tokens[0][4])
         if m:
             qnum = int(m.group(1))
-            after_index = 1
 
         # Case 2: first two tokens are "125" "."
         if qnum is None and len(tokens) >= 2 and NUM_RE.match(tokens[0][4]) and tokens[1][4] == ".":
             qnum = int(tokens[0][4])
-            after_index = 2
 
-        # Fallback: old strict mode where the line is almost only "n."
-        if qnum is None and not require_bracket_after_number and len(compact) <= max_line_chars:
-            for idx, (x0, y0, x1, y1, txt) in enumerate(tokens):
+        # Case 3: old strict mode where line is almost only "n."
+        if qnum is None and len(compact) <= max_line_chars:
+            for (x0, y0, x1, y1, txt) in tokens:
                 m = NUMDOT_RE.match(txt)
                 if m:
                     qnum = int(m.group(1))
                     y_top = y0
-                    after_index = idx + 1
                     break
 
         if qnum is None:
             continue
 
-        if require_bracket_after_number:
-            after_text = " ".join(t[4] for t in tokens[after_index:after_index + 6])
-            if "[" not in after_text:
-                continue
-        elif len(compact) > max_line_chars:
+        if not allow_inline_question_text and len(compact) > max_line_chars:
             continue
 
         anchors.append((qnum, y_top))
@@ -640,6 +680,7 @@ def detect_question_anchors(page, left_ratio=0.28, max_line_chars=8, require_bra
             continue
         deduped.append((q, y))
     return deduped
+
 
 def band_text(page, clip):
     return page.get_text("text", clip=clip) or ""
@@ -670,23 +711,6 @@ def find_footer_start_y(page, y_from, y_to):
             ys.append(y0)
     return min(ys) if ys else None
 
-
-
-def find_section_break_y(page, y_from, y_to):
-    """Return y of divider text such as '※ 겨울 ...' between two problems."""
-    ys = []
-    for tokens in group_words_into_lines(page.get_text("words")):
-        if not tokens:
-            continue
-        line_text = " ".join(t[4] for t in tokens).strip()
-        y0 = min(t[1] for t in tokens)
-        if y0 < y_from or y0 > y_to:
-            continue
-        if y0 <= y_from + 35:
-            continue
-        if SECTION_BREAK_RE.search(line_text):
-            ys.append(y0)
-    return min(ys) if ys else None
 
 def content_bottom_y(page, y_from, y_to):
     bottoms = []
@@ -782,7 +806,8 @@ def compute_rects_for_pdf(
     pad_top: int = 10,
     pad_bottom: int = 12,
     last_question_extra_px: int = 30,
-    require_bracket_after_number: bool = True,
+    allow_inline_question_text: bool = True,
+    require_example_anchor: bool = True,
 ):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     rects = []
@@ -792,7 +817,11 @@ def compute_rects_for_pdf(
     for pno in range(len(doc)):
         page = doc[pno]
         w, h = page.rect.width, page.rect.height
-        anchors = detect_question_anchors(page, require_bracket_after_number=require_bracket_after_number)
+        anchors = detect_question_anchors(
+            page,
+            allow_inline_question_text=allow_inline_question_text,
+            require_example_anchor=require_example_anchor,
+        )
         if not anchors:
             continue
 
@@ -810,11 +839,6 @@ def compute_rects_for_pdf(
             footer_y = find_footer_start_y(page, y_start, y_cap)
             if footer_y is not None and footer_y > y_start + 120:
                 y_cap = min(y_cap, footer_y - 4)
-                y_end = min(y_end, y_cap)
-
-            section_break_y = find_section_break_y(page, y_start, y_cap)
-            if section_break_y is not None and section_break_y > y_start + 60:
-                y_cap = min(y_cap, section_break_y - 4)
                 y_end = min(y_end, y_cap)
 
             mcq_last = last_choice_bottom_y_in_band(page, y_start, y_cap)
@@ -1275,9 +1299,367 @@ def make_packet_pdf(title: str, items: List[PacketItem], page_size_name: str = "
     return out.getvalue()
 
 
+
+# =========================================================
+# Overrides for manual Drive upload + direct remedial packet generation
+# =========================================================
+def ensure_png_filename(value: str) -> str:
+    """Normalize FileName values such as '1.1-5' -> '1.1-5.png'."""
+    s = str(value or "").strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return ""
+    base = Path(s).name
+    if base.lower().endswith(".png"):
+        return base
+    parsed = parse_problem_filename(base)
+    if parsed:
+        code, qno = parsed
+        return f"{code}-{qno}.png"
+    # If the user typed only a base name, still append .png.
+    if re.match(r"^\d{1,2}\.\d{1,2}\s*[-_]\s*\d{1,4}$", base):
+        return base.replace("_", "-") + ".png"
+    return base
+
+
+def normalize_db(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Supports both schemas:
+      New: Code, UnitName, QNo, FileName, FolderName, FolderLink, DriveFileId, ExpectedCount, Answer, Notes
+      Old: Major, Minor, MajorFolder, MinorFolder, FolderLink, FileName, Answer
+    FileName may be either '1.1-5' or '1.1-5.png'.
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if "Code" in df.columns:
+        df["Code"] = df["Code"].apply(lambda x: parse_code_token(x) or "")
+    elif {"Major", "Minor"}.issubset(df.columns):
+        def mm_to_code(r):
+            try:
+                if str(r.get("Major", "")).strip() and str(r.get("Minor", "")).strip():
+                    return f"{int(float(r['Major']))}.{int(float(r['Minor']))}"
+            except Exception:
+                return ""
+            return ""
+        df["Code"] = df.apply(mm_to_code, axis=1)
+    else:
+        # Last fallback: parse code from FileName if possible.
+        if "FileName" in df.columns:
+            df["Code"] = df["FileName"].apply(lambda x: parse_problem_filename(x)[0] if parse_problem_filename(x) else "")
+        else:
+            df["Code"] = ""
+
+    if "FileName" not in df.columns:
+        if "QNo" in df.columns:
+            df["FileName"] = df.apply(
+                lambda r: f"{r.get('Code','')}-{int(float(r.get('QNo', 0)))}.png"
+                if str(r.get("Code", "")).strip() and str(r.get("QNo", "")).strip()
+                else "",
+                axis=1,
+            )
+        else:
+            df["FileName"] = ""
+    df["FileName"] = df["FileName"].apply(ensure_png_filename)
+
+    if "QNo" not in df.columns:
+        df["QNo"] = df["FileName"].apply(lambda x: parse_problem_filename(x)[1] if parse_problem_filename(x) else None)
+    else:
+        # Fill missing QNo from filename.
+        def fill_qno(r):
+            q = r.get("QNo", "")
+            if str(q).strip() and str(q).strip().lower() not in {"nan", "none"}:
+                return q
+            parsed = parse_problem_filename(r.get("FileName", ""))
+            return parsed[1] if parsed else None
+        df["QNo"] = df.apply(fill_qno, axis=1)
+
+    if "UnitName" not in df.columns:
+        if "MinorFolder" in df.columns:
+            df["UnitName"] = df["MinorFolder"].astype(str)
+        else:
+            df["UnitName"] = df["Code"].map(lambda c: UNIT_META.get(c, {}).get("UnitName", ""))
+    df["UnitName"] = df.apply(
+        lambda r: str(r.get("UnitName", "")).strip() or UNIT_META.get(r.get("Code", ""), {}).get("UnitName", ""),
+        axis=1,
+    )
+
+    if "ExpectedCount" not in df.columns:
+        df["ExpectedCount"] = df["Code"].map(lambda c: UNIT_META.get(c, {}).get("ExpectedCount", ""))
+
+    if "FolderName" not in df.columns:
+        if "MinorFolder" in df.columns:
+            df["FolderName"] = df["MinorFolder"].astype(str)
+        else:
+            df["FolderName"] = df.apply(lambda r: folder_display_name(r.get("Code", ""), r.get("UnitName", "")), axis=1)
+
+    for c in DB_HEADERS:
+        if c not in df.columns:
+            df[c] = ""
+
+    df = df[DB_HEADERS].copy()
+    df["Code"] = df["Code"].astype(str).str.strip()
+    df["QNo"] = pd.to_numeric(df["QNo"], errors="coerce").astype("Int64")
+    df["ExpectedCount"] = pd.to_numeric(df["ExpectedCount"], errors="coerce").astype("Int64")
+    df["FileName"] = df["FileName"].astype(str).apply(ensure_png_filename)
+    for c in ["FolderLink", "DriveFileId", "Answer", "Notes", "FolderName", "UnitName"]:
+        df[c] = df[c].astype(str).replace({"nan": "", "None": ""})
+
+    df = df[df["Code"].isin(UNIT_META.keys())]
+    df = df.sort_values(["Code", "QNo"], key=lambda col: col.map(sort_code_key) if col.name == "Code" else col)
+    return df.reset_index(drop=True)
+
+
+def first_nonempty(series: pd.Series) -> str:
+    for v in series.tolist():
+        s = str(v or "").strip()
+        if s and s.lower() not in {"nan", "none"}:
+            return s
+    return ""
+
+
+def build_packet_items(
+    df_db: pd.DataFrame,
+    codes: List[str],
+    small_max: int,
+    mid_max: int,
+    rng: random.Random,
+) -> Tuple[List[PacketItem], List[str]]:
+    """
+    Build packet items from manually uploaded Drive folders.
+    It uses DriveFileId if present. Otherwise it uses FolderLink + FileName.
+    If FileName rows are missing but FolderLink exists, it can list PNGs in that Drive folder and choose from them.
+    """
+    items: List[PacketItem] = []
+    warnings: List[str] = []
+
+    for code in codes:
+        unit_meta = UNIT_META.get(code, {})
+        unit_name = unit_meta.get("UnitName", code)
+        expected = int(unit_meta.get("ExpectedCount", 0) or 0)
+
+        subset_all = df_db[df_db["Code"] == code].copy()
+        if subset_all.empty:
+            warnings.append(f"{code} {unit_name}: Sheet1 DB에 해당 단원 행이 없습니다.")
+            continue
+
+        folder_link = first_nonempty(subset_all.get("FolderLink", pd.Series(dtype=str)))
+        folder_id = ""
+        file_map: Dict[str, str] = {}
+        if folder_link:
+            try:
+                folder_id = extract_folder_id(folder_link)
+                file_map = list_png_files_in_folder(folder_id)
+            except Exception as e:
+                warnings.append(f"{code} {unit_name}: FolderLink 확인 실패 ({e})")
+
+        # Candidate rows from DB rows with FileName.
+        candidates = []
+        rows = subset_all[subset_all["FileName"].astype(str).str.strip() != ""].copy()
+        rows = rows.drop_duplicates(subset=["FileName"], keep="first")
+        rows = rows.sort_values("QNo")
+
+        for _, row in rows.iterrows():
+            filename = ensure_png_filename(row.get("FileName", ""))
+            if not filename:
+                continue
+            file_id = str(row.get("DriveFileId", "")).strip()
+            if not file_id and file_map:
+                file_id = file_map.get(filename, "")
+            # If neither DriveFileId nor FolderLink lookup works, keep candidate but it may fail later with warning.
+            candidates.append({
+                "filename": filename,
+                "qno": row.get("QNo", ""),
+                "answer": "" if pd.isna(row.get("Answer", "")) else str(row.get("Answer", "")).strip(),
+                "file_id": file_id,
+            })
+
+        # Fallback: one row per folder only. Use actual PNG list in Drive folder.
+        if not candidates and file_map:
+            for filename, fid in sorted(file_map.items(), key=lambda kv: (parse_problem_filename(kv[0])[1] if parse_problem_filename(kv[0]) else 99999, kv[0])):
+                parsed = parse_problem_filename(filename)
+                candidates.append({
+                    "filename": filename,
+                    "qno": parsed[1] if parsed else "",
+                    "answer": "",
+                    "file_id": fid,
+                })
+
+        if not candidates:
+            warnings.append(f"{code} {unit_name}: 가져올 수 있는 PNG가 없습니다. FileName 또는 FolderLink를 확인해줘.")
+            continue
+
+        available = len(candidates)
+        k = desired_pick_count(available, expected, small_max=small_max, mid_max=mid_max)
+        if k <= 0:
+            warnings.append(f"{code} {unit_name}: 선택 가능한 문제가 없습니다.")
+            continue
+
+        chosen = rng.sample(candidates, k=k) if available > k else candidates
+        chosen = sorted(chosen, key=lambda x: (int(x["qno"]) if str(x["qno"]).isdigit() else 99999, x["filename"]))
+
+        first = True
+        for cand in chosen:
+            file_id = cand.get("file_id", "")
+            if not file_id:
+                warnings.append(f"{code} {unit_name} / {cand['filename']}: Drive에서 파일을 찾지 못했습니다.")
+                continue
+            try:
+                png_bytes = download_drive_file_bytes(file_id)
+            except Exception as e:
+                warnings.append(f"{code} {unit_name} / {cand['filename']}: 다운로드 실패 ({e})")
+                continue
+
+            qno = cand.get("qno", "")
+            q_label = f"{code}-{qno}" if str(qno).strip() and str(qno).strip() != "<NA>" else Path(cand["filename"]).stem
+            items.append((code, unit_name, q_label, cand["filename"], png_bytes, cand.get("answer", ""), first))
+            first = False
+
+    return items, warnings
+
+
+def pdf_text(text: str, korean_ok: bool) -> str:
+    """Avoid ReportLab Helvetica Unicode errors if Korean font is missing."""
+    s = str(text or "")
+    if korean_ok:
+        return s
+    try:
+        s.encode("latin-1")
+        return s
+    except Exception:
+        return re.sub(r"[^\x00-\x7F]+", "", s)
+
+
+def make_packet_pdf(title: str, items: List[PacketItem], page_size_name: str = "Letter") -> bytes:
+    """
+    Layout based on the user's uploaded packet code:
+    - Title only on the first page
+    - Same top title gap on every page
+    - Category printed once per selected unit
+    - 2 to 3 question images per page when possible
+    - Answer printed under each image, right aligned
+    """
+    korean_ok = ensure_korean_font_registered()
+    title_font = FONT_NAME if korean_ok else "Helvetica"
+    body_font = FONT_NAME if korean_ok else "Helvetica"
+
+    pagesize = A4 if page_size_name == "A4" else letter
+    out = io.BytesIO()
+    c = canvas.Canvas(out, pagesize=pagesize)
+    W, H = pagesize
+
+    margin_x = 42
+    margin_top = 52
+    margin_bottom = 48
+    title_font_size = 15
+    body_font_size = 9
+
+    title_gap = 30
+    content_top = (H - margin_top) - title_gap
+    category_h = 13
+    category_gap = 5
+    answer_h = 13
+    block_gap = 9
+    min_scale_for_three = 0.43
+    max_w = W - 2 * margin_x
+
+    def draw_footer():
+        c.setFont(body_font, 7)
+        c.drawRightString(W - margin_x, 24, pdf_text("YOU, GENIUS 유지니어스 MATH with 유진쌤", korean_ok))
+
+    def compute_scale(iw: float, ih: float, slot_h: float, has_category_line: bool) -> float:
+        extra_cat = category_h + category_gap if has_category_line else 0
+        usable_h = slot_h - extra_cat - answer_h - block_gap
+        if usable_h <= 25:
+            return 0.0
+        return min(max_w / iw, usable_h / ih)
+
+    idx = 0
+    page_index = 0
+    n_total = len(items)
+
+    while idx < n_total:
+        if page_index == 0:
+            draw_fake_bold_string(c, margin_x, H - margin_top, pdf_text(title, korean_ok), title_font, title_font_size)
+
+        avail_h = content_top - margin_bottom
+        remaining = n_total - idx
+
+        def can_fit(k: int) -> bool:
+            if remaining < k:
+                return False
+            slot_h = avail_h / k
+            scales = []
+            for j in range(k):
+                _code, _unit, _ql, _fn, png_bytes, _ans, show_cat = items[idx + j]
+                img = ImageReader(io.BytesIO(png_bytes))
+                iw, ih = img.getSize()
+                scales.append(compute_scale(iw, ih, slot_h, show_cat))
+            return bool(scales) and min(scales) >= min_scale_for_three
+
+        if remaining >= 3 and can_fit(3):
+            per_page = 3
+            slot_h = avail_h / 3
+        elif remaining >= 2:
+            per_page = 2
+            slot_h = avail_h / 2
+        else:
+            per_page = 1
+            slot_h = avail_h
+
+        c.setFont(body_font, body_font_size)
+
+        for block_i in range(per_page):
+            if idx >= n_total:
+                break
+            code, unit_name, q_label, _filename, png_bytes, answer, show_cat = items[idx]
+            slot_top = content_top - slot_h * block_i
+            slot_bottom = content_top - slot_h * (block_i + 1)
+            y = slot_top
+
+            if show_cat:
+                cat_text = f"Category: {code} {unit_name}"
+                c.drawString(margin_x, y, pdf_text(cat_text, korean_ok))
+                y -= (category_h + category_gap)
+
+            img = ImageReader(io.BytesIO(png_bytes))
+            iw, ih = img.getSize()
+            usable_h = (y - slot_bottom) - answer_h - block_gap
+            if usable_h <= 25:
+                break
+
+            scale = min(max_w / iw, usable_h / ih)
+            if scale <= 0:
+                break
+
+            draw_w = iw * scale
+            draw_h = ih * scale
+            img_x = margin_x
+            img_y = y - draw_h
+            c.drawImage(img, img_x, img_y, width=draw_w, height=draw_h, preserveAspectRatio=True, mask="auto")
+
+            ans = str(answer or "").strip()
+            answer_text = f"Answer:{ans}" if ans else "Answer:"
+            answer_text = pdf_text(answer_text, korean_ok)
+            answer_y = img_y - answer_h
+            try:
+                text_w = pdfmetrics.stringWidth(answer_text, body_font, body_font_size)
+            except Exception:
+                text_w = 0
+            c.drawString(max(margin_x, W - margin_x - text_w), answer_y, answer_text)
+            idx += 1
+
+        draw_footer()
+        c.showPage()
+        page_index += 1
+
+    c.save()
+    return out.getvalue()
+
+
 # =========================================================
 # UI
 # =========================================================
+require_access_code()
 st.title(APP_TITLE)
 st.caption(f"단원표 기준 총 {TOTAL_EXPECTED}문항 / {len(UNIT_ROWS)}개 단원")
 
@@ -1287,29 +1669,31 @@ with st.expander("단원 코드표 확인", expanded=False):
 sheet_id = safe_sheet_id()
 
 with st.sidebar:
+    logout_button()
+    st.divider()
     st.header("기본 설정")
     sheet_id = st.text_input("Google Sheet ID", value=sheet_id)
-    st.caption("Sheet1 = DB, Sheet2 = 학생표(Class, StudentName, Needs)")
+    st.caption("Sheet1 DB만 읽습니다. ZIP 자동 Drive 업로드 기능은 뺐어요.")
+    st.markdown("**필요한 폰트 경로**  ")
+    st.code("assets/fonts/NotoSansKR-VariableFont_wght.ttf")
     if st.button("캐시 새로고침"):
         st.cache_data.clear()
         st.cache_resource.clear()
         st.success("캐시를 비웠어요.")
 
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3 = st.tabs([
     "1️⃣ PDF → PNG ZIP",
-    "2️⃣ ZIP → Drive/Sheet",
-    "3️⃣ 보충 Packet 생성",
-    "4️⃣ DB 점검",
+    "2️⃣ 보충 Packet 생성",
+    "3️⃣ DB 점검",
 ])
-
 
 # -------------------------
 # TAB 1
 # -------------------------
 with tab1:
     st.subheader("1️⃣ PDF를 문제별 PNG ZIP으로 만들기")
-    st.write("PDF에 있는 문제를 위에서 아래 순서대로 잘라서 `1.1-1.png`, `1.1-2.png`처럼 저장합니다.")
+    st.write("PDF에 있는 문제를 위에서 아래 순서대로 잘라서 `1.1-1.png`, `1.1-2.png`처럼 저장합니다. ZIP은 여기서 다운로드한 뒤 직접 Drive에 올리면 됩니다.")
 
     pdf = st.file_uploader("문제은행 PDF 업로드", type=["pdf"], key="tab1_pdf")
 
@@ -1317,16 +1701,12 @@ with tab1:
     zoom = c1.slider("해상도 zoom", 2.0, 4.5, 3.0, 0.1)
     pad_top = c2.slider("위 여백", 0, 120, 10, 1)
     pad_bottom = c3.slider("아래 여백", 0, 180, 12, 1)
-    last_extra = c4.slider("페이지 마지막 문제 추가 여백(px)", 0, 400, 30, 10)
+    last_extra = c4.slider("페이지 마지막 문제 아래 여백(px)", 0, 300, 30, 10)
 
     naming_mode = st.radio(
-        "파일명 부여 방식",
-        [
-            "전체 1255문항: 표 순서대로 자동 이름 붙이기",
-            "선택한 단원 하나로만 이름 붙이기",
-            "CSV 매핑으로 이름 붙이기",
-        ],
-        horizontal=False,
+        "파일명 붙이는 방식",
+        ["전체 1255문항: 표 순서대로 자동 이름 붙이기", "선택한 단원 하나로만 이름 붙이기", "CSV 매핑으로 이름 붙이기"],
+        horizontal=True,
     )
 
     selected_code = None
@@ -1335,13 +1715,19 @@ with tab1:
         selected_label = st.selectbox("단원 선택", options=get_unit_options())
         selected_code = label_to_code(selected_label)
     elif naming_mode == "CSV 매핑으로 이름 붙이기":
-        st.caption("CSV에는 최소 `FileName` 컬럼이 있어야 합니다. 예: 1.1-1.png, 1.1-2.png")
-        mapping_file = st.file_uploader("매핑 CSV 업로드", type=["csv"], key="mapping_csv")
+        st.info("CSV에는 FileName 컬럼이 필요합니다. 예: 1.1-1.png")
+        mapping_file = st.file_uploader("CSV 매핑 업로드", type=["csv"], key="mapping_csv")
 
     cc1, cc2 = st.columns(2)
     put_unit_folders = cc1.checkbox("ZIP 안에 단원별 폴더 만들기", value=True)
     unify_width = cc2.checkbox("가로폭을 가장 넓은 문제에 맞춤", value=True)
-    require_bracket = st.checkbox("문제 시작을 `번호. [Example...]` 패턴으로만 인식 (현재 문제은행 권장)", value=True)
+
+    allow_inline = st.checkbox("문제번호가 문제 문장과 같은 줄에 있어도 anchor로 인식", value=True)
+    require_example_anchor = st.checkbox(
+        "문제 시작 줄에 [Example]이 있는 이 문제은행 PDF 전용으로 인식",
+        value=True,
+        help="켜두면 1. Linear 같은 단원 제목, 1./2./3./4. 번호 선택지, 줄바꿈으로 생긴 '8. What ...' 같은 가짜 anchor를 제외합니다.",
+    )
 
     if pdf is not None and st.button("문제별 PNG ZIP 생성", type="primary"):
         try:
@@ -1353,7 +1739,8 @@ with tab1:
                     pad_top=pad_top,
                     pad_bottom=pad_bottom,
                     last_question_extra_px=last_extra,
-                    require_bracket_after_number=require_bracket,
+                    allow_inline_question_text=allow_inline,
+                    require_example_anchor=require_example_anchor,
                 )
 
                 if naming_mode == "전체 1255문항: 표 순서대로 자동 이름 붙이기":
@@ -1382,29 +1769,10 @@ with tab1:
 
             detected = len(rects)
             expected = len(plan)
-            if naming_mode == "전체 1255문항: 표 순서대로 자동 이름 붙이기":
-                prefix_total = 0
-                prefix_label = None
-                for code, unit_name, cnt in UNIT_ROWS:
-                    prefix_total += int(cnt)
-                    if detected == prefix_total:
-                        prefix_label = f"{code} {unit_name}까지"
-                        break
-
-                if detected == TOTAL_EXPECTED:
-                    st.success(f"완료! 전체 문제 {detected}개를 생성했습니다.")
-                elif prefix_label:
-                    st.success(
-                        f"완료! 감지된 {detected}개를 표 순서 기준으로 `{prefix_label}` 자동 이름 붙였습니다."
-                    )
-                else:
-                    st.warning(
-                        f"감지된 문제 수는 {detected}개입니다. 이 수가 단원표의 누적 문항수와 딱 맞지 않습니다. "
-                        "문제 누락/추가 감지 가능성이 있으니 index.csv를 꼭 확인해줘."
-                    )
-            elif detected != expected:
+            if detected != expected:
                 st.warning(
                     f"감지된 문제 수는 {detected}개, 파일명 계획은 {expected}개입니다. "
+                    "ZIP에는 감지된 문제 수만큼만 저장됩니다. 부분 PDF라면 정상일 수 있고, "
                     "순서가 맞는지 index.csv를 꼭 확인해줘."
                 )
             else:
@@ -1417,64 +1785,12 @@ with tab1:
             st.error("생성 중 오류가 발생했어요.")
             st.code(str(e))
 
-
 # -------------------------
 # TAB 2
 # -------------------------
 with tab2:
-    st.subheader("2️⃣ PNG ZIP을 Google Drive에 업로드하고 Sheet1 DB 만들기")
-    st.write("Tab 1에서 만든 ZIP을 올리면, 단원별 Drive 폴더를 만들고 Sheet1에 DB를 기록합니다.")
-
-    zip_upload = st.file_uploader("Tab 1에서 만든 PNG ZIP 업로드", type=["zip"], key="tab2_zip")
-    root_folder_input = st.text_input("문제은행 Root Google Drive 폴더 링크 또는 ID", value="", key="root_folder")
-
-    u1, u2 = st.columns(2)
-    overwrite = u1.checkbox("Drive에 같은 이름 PNG가 있으면 덮어쓰기", value=True)
-    replace_db = u2.checkbox("Sheet1 DB를 새로 덮어쓰기", value=True)
-
-    if zip_upload is not None:
-        try:
-            preview_pngs = iter_pngs_from_zip(zip_upload.getvalue())
-            st.info(f"ZIP 안에서 인식된 PNG: {len(preview_pngs)}개")
-            if preview_pngs:
-                preview_df = pd.DataFrame(
-                    [{"FileName": x[0], "Code": x[2], "QNo": x[3], "ZipPath": x[4]} for x in preview_pngs[:50]]
-                )
-                st.dataframe(preview_df, use_container_width=True, hide_index=True)
-        except Exception as e:
-            st.error("ZIP 미리보기 중 오류가 발생했어요.")
-            st.code(str(e))
-
-    if st.button("Drive 업로드 + Sheet1 DB 작성", type="primary"):
-        if zip_upload is None:
-            st.error("ZIP 파일을 먼저 올려줘.")
-            st.stop()
-        if not root_folder_input.strip():
-            st.error("Google Drive Root 폴더 링크 또는 ID를 입력해줘.")
-            st.stop()
-        try:
-            root_folder_id = extract_folder_id(root_folder_input)
-            progress = st.progress(0)
-            with st.spinner("Drive에 업로드하고 Sheet1 DB를 만드는 중..."):
-                rows = upload_zip_to_drive_and_build_rows(
-                    zip_upload.getvalue(), root_folder_id=root_folder_id, overwrite=overwrite, progress_bar=progress
-                )
-                mode = "replace" if replace_db else "append"
-                write_db_rows(sheet_id, rows, mode=mode)
-                ensure_roster_headers(sheet_id)
-
-            st.success(f"완료! {len(rows)}개 PNG를 DB에 기록했습니다.")
-            st.dataframe(pd.DataFrame(rows).head(100), use_container_width=True, hide_index=True)
-        except Exception as e:
-            st.error("업로드/DB 작성 중 오류가 발생했어요.")
-            st.code(str(e))
-
-
-# -------------------------
-# TAB 3
-# -------------------------
-with tab3:
-    st.subheader("3️⃣ 학생별 보충 Packet 생성")
+    st.subheader("2️⃣ 학생별 보충 Packet 생성")
+    st.write("학생 이름과 반을 입력하고, 보충이 필요한 단원을 여러 개 직접 선택하면 PDF가 생성됩니다.")
 
     p1, p2, p3 = st.columns(3)
     small_max = p1.number_input("문항수 ≤ 이 값이면 3개", min_value=1, max_value=100, value=20, step=1)
@@ -1492,125 +1808,57 @@ with tab3:
         st.stop()
 
     if df_db.empty:
-        st.warning("Sheet1 DB가 비어 있어요. 먼저 Tab 2에서 DB를 만들어줘.")
+        st.warning("Sheet1 DB가 비어 있어요. Drive에 직접 업로드한 뒤 Sheet1에 FileName/Code/FolderLink 정보를 넣어줘.")
         st.stop()
 
-    mode = st.radio("생성 모드", ["학생 1명 직접 생성", "Sheet2 여러 학생 ZIP 생성"], horizontal=True)
+    with st.expander("현재 Sheet1에서 읽은 DB 미리보기", expanded=False):
+        st.dataframe(df_db.head(80), use_container_width=True, hide_index=True)
 
-    if mode == "학생 1명 직접 생성":
-        col1, col2 = st.columns(2)
-        student_name = col1.text_input("학생 이름", value="")
-        class_name = col2.text_input("반/Class", value="")
+    col1, col2 = st.columns(2)
+    student_name = col1.text_input("학생 이름", value="")
+    class_name = col2.text_input("반/Class", value="")
 
-        selected_labels = st.multiselect("부족 단원 선택", options=get_unit_options())
-        selected_codes = [label_to_code(x) for x in selected_labels]
-        selected_codes = [c for c in selected_codes if c]
+    selected_labels = st.multiselect("보충이 필요한 단원 선택", options=get_unit_options())
+    selected_codes = [label_to_code(x) for x in selected_labels]
+    selected_codes = [c for c in selected_codes if c]
 
-        if st.button("PDF 생성", type="primary"):
-            if not student_name.strip() or not class_name.strip():
-                st.error("학생 이름과 반을 입력해줘.")
-                st.stop()
-            if not selected_codes:
-                st.error("부족 단원을 최소 1개 선택해줘.")
-                st.stop()
+    display_title = f"{class_name.strip()} {student_name.strip()} 보충 PACKET".strip()
+    file_title = sanitize_filename(f"{student_name.strip()}_{class_name.strip()}_보충 PACKET")
+    st.write("PDF 제목 미리보기:", display_title if display_title else "")
 
-            with st.spinner("Drive에서 문제 이미지를 가져와 PDF를 만드는 중..."):
-                items, warns = build_packet_items(df_db, selected_codes, int(small_max), int(mid_max), rng)
-                if not items:
-                    st.error("PDF에 넣을 문제가 없습니다. DB/Drive 권한/파일명을 확인해줘.")
-                    if warns:
-                        st.code("\n".join(warns))
-                    st.stop()
-                title = sanitize_filename(f"{student_name}_{class_name}_보충 PACKET")
-                pdf_bytes = make_packet_pdf(title, items, page_size_name=page_size_name)
-
-            st.success(f"완료! 총 {len(items)}문제")
-            if warns:
-                with st.expander("경고/누락 확인"):
-                    st.write("\n".join(warns))
-            st.download_button("PDF 다운로드", data=pdf_bytes, file_name=f"{title}.pdf", mime="application/pdf")
-
-    else:
-        try:
-            df_roster = load_roster_from_sheet(sheet_id)
-        except Exception as e:
-            st.error("Sheet2 학생표를 읽는 중 오류가 발생했어요.")
-            st.code(str(e))
+    if st.button("PDF 생성", type="primary"):
+        if not student_name.strip() or not class_name.strip():
+            st.error("학생 이름과 반을 입력해줘.")
+            st.stop()
+        if not selected_codes:
+            st.error("보충 단원을 최소 1개 선택해줘.")
             st.stop()
 
-        if df_roster.empty:
-            st.warning("Sheet2에 학생표가 비어 있어요. 헤더는 Class, StudentName, Needs 입니다.")
-            st.stop()
-
-        classes = sorted([c for c in df_roster["Class"].dropna().unique().tolist() if str(c).strip()])
-        selected_class = st.selectbox("Class 필터", options=["(전체)"] + classes)
-        df_view = df_roster.copy()
-        if selected_class != "(전체)":
-            df_view = df_view[df_view["Class"] == selected_class]
-
-        max_students = st.number_input(
-            "한 번에 생성할 최대 학생 수", min_value=1, max_value=500, value=min(30, max(1, len(df_view))), step=1
-        )
-        df_view = df_view.head(int(max_students))
-        st.write(f"대상 학생 수: {len(df_view)}")
-        st.dataframe(df_view, use_container_width=True, hide_index=True)
-
-        if st.button("여러 학생 PDF ZIP 생성", type="primary"):
-            if df_view.empty:
-                st.error("대상 학생이 없습니다.")
+        with st.spinner("Drive에서 문제 이미지를 가져와 PDF를 만드는 중..."):
+            items, warns = build_packet_items(df_db, selected_codes, int(small_max), int(mid_max), rng)
+            if not items:
+                st.error("PDF에 넣을 문제가 없습니다. DB/Drive 권한/파일명/FolderLink를 확인해줘.")
+                if warns:
+                    st.code("\n".join(warns))
                 st.stop()
+            pdf_bytes = make_packet_pdf(display_title, items, page_size_name=page_size_name)
 
-            zip_buf = io.BytesIO()
-            all_warnings: List[str] = []
-            progress = st.progress(0)
-
-            with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for idx, (_, r) in enumerate(df_view.iterrows(), start=1):
-                    cls = str(r.get("Class", "")).strip()
-                    name = str(r.get("StudentName", "")).strip()
-                    needs_text = str(r.get("Needs", "")).strip()
-                    codes = parse_needs(needs_text)
-                    if not cls or not name or not codes:
-                        all_warnings.append(f"{name or '(이름없음)'}: Class/StudentName/Needs 누락")
-                        progress.progress(idx / len(df_view))
-                        continue
-
-                    student_seed = f"{seed_text}-{cls}-{name}" if seed_text.strip() else None
-                    student_rng = random.Random(student_seed)
-                    items, warns = build_packet_items(df_db, codes, int(small_max), int(mid_max), student_rng)
-                    all_warnings.extend([f"{name}: {w}" for w in warns])
-                    if not items:
-                        progress.progress(idx / len(df_view))
-                        continue
-
-                    title = sanitize_filename(f"{name}_{cls}_보충 PACKET")
-                    pdf_bytes = make_packet_pdf(title, items, page_size_name=page_size_name)
-                    zf.writestr(f"{title}.pdf", pdf_bytes)
-                    progress.progress(idx / len(df_view))
-
-                if all_warnings:
-                    zf.writestr("warnings.txt", "\n".join(all_warnings).encode("utf-8-sig"))
-
-            zip_buf.seek(0)
-            zip_name = sanitize_filename(f"{selected_class if selected_class != '(전체)' else 'ALL'}_PACKETS.zip")
-            st.success("배치 생성 완료!")
-            if all_warnings:
-                with st.expander("경고/누락 확인"):
-                    st.write("\n".join(all_warnings[:200]))
-                    if len(all_warnings) > 200:
-                        st.caption(f"나머지 {len(all_warnings)-200}개 경고는 ZIP 안의 warnings.txt에서 확인하세요.")
-            st.download_button("ZIP 다운로드", data=zip_buf.getvalue(), file_name=zip_name, mime="application/zip")
-
+        st.success(f"완료! 총 {len(items)}문제")
+        if warns:
+            with st.expander("경고/누락 확인"):
+                st.write("\n".join(warns))
+        st.download_button("PDF 다운로드", data=pdf_bytes, file_name=f"{file_title}.pdf", mime="application/pdf")
 
 # -------------------------
-# TAB 4
+# TAB 3
 # -------------------------
-with tab4:
-    st.subheader("4️⃣ DB 점검")
-    st.write("Sheet1에 기록된 파일 수가 단원표의 문항수와 맞는지 확인합니다.")
+with tab3:
+    st.subheader("3️⃣ DB 점검")
+    st.write("Sheet1에 기록된 파일 수가 단원표의 문항수와 맞는지 확인합니다. 수동 업로드 후 DB 확인용입니다.")
 
     if st.button("DB 다시 불러오기"):
         load_db_from_sheet.clear()
+        list_png_files_in_folder.clear()
 
     try:
         df_db_check = load_db_from_sheet(sheet_id)
@@ -1622,12 +1870,13 @@ with tab4:
     if df_db_check.empty:
         st.warning("DB가 비어 있습니다.")
     else:
-        actual = df_db_check.groupby("Code").size().reset_index(name="UploadedCount")
+        file_rows = df_db_check[df_db_check["FileName"].astype(str).str.strip() != ""].copy()
+        actual = file_rows.groupby("Code").size().reset_index(name="DBFileNameCount")
         check = UNIT_DF.merge(actual, on="Code", how="left")
-        check["UploadedCount"] = check["UploadedCount"].fillna(0).astype(int)
-        check["Missing"] = check["ExpectedCount"] - check["UploadedCount"]
+        check["DBFileNameCount"] = check["DBFileNameCount"].fillna(0).astype(int)
+        check["Missing"] = check["ExpectedCount"] - check["DBFileNameCount"]
         check["Status"] = check["Missing"].apply(lambda x: "OK" if x == 0 else ("부족" if x > 0 else "초과"))
-        st.metric("DB 총 PNG 수", int(check["UploadedCount"].sum()))
+        st.metric("Sheet1 FileName 행 수", int(check["DBFileNameCount"].sum()))
         st.metric("표 기준 총 문항수", TOTAL_EXPECTED)
         st.dataframe(check, use_container_width=True, hide_index=True)
 
