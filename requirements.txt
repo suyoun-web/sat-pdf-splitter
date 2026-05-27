@@ -2,8 +2,7 @@ streamlit
 pandas
 PyMuPDF
 Pillow
-gspread
-google-auth
 google-api-python-client
+google-auth
+gspread
 reportlab
-
