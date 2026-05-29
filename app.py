@@ -1001,11 +1001,27 @@ def compute_rects_for_pdf(
     last_question_extra_px: int = 30,
     allow_inline_question_text: bool = True,
     require_example_anchor: bool = True,
+    exclude_question_number_line: bool = True,
+    number_line_offset: int = 2,
+    protect_graph_table_bottom: bool = True,
+    ink_bottom_extra: int = 8,
 ):
+    """Find crop rectangles for each problem.
+
+    Important for this problem-bank PDF:
+    - Real problem starts are detected by the number + [Example] line.
+    - If exclude_question_number_line=True, the saved PNG starts below that line.
+    - Some choices are not A/B/C/D text; they are Roman-numeral table/graph choices
+      such as I, II, III, IV. Those lower tables can be vector drawings, so text-only
+      bottom detection may cut them off. protect_graph_table_bottom scans the whole
+      candidate band by raster ink before any text-based shrinking, then keeps the
+      bottom at least as low as the lowest ink.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     rects = []
     side_pad_pt = SIDE_PAD_PX / zoom
     last_extra_pt = last_question_extra_px / zoom
+    ink_extra_pt = ink_bottom_extra / zoom
 
     for pno in range(len(doc)):
         page = doc[pno]
@@ -1019,9 +1035,12 @@ def compute_rects_for_pdf(
             continue
 
         for i, (printed_qnum, y0, y0_bottom) in enumerate(anchors):
-            # Start the crop BELOW the number/anchor line so the printed
-            # question number is excluded from the saved PNG.
-            y_start = clamp(y0_bottom + 2, 0, h)
+            if exclude_question_number_line:
+                # Start the crop BELOW the number/anchor line so the printed
+                # question number is excluded from the saved PNG.
+                y_start = clamp(y0_bottom + number_line_offset, 0, h)
+            else:
+                y_start = clamp(y0 - pad_top, 0, h)
 
             if i + 1 < len(anchors):
                 next_y = anchors[i + 1][1]
@@ -1036,6 +1055,18 @@ def compute_rects_for_pdf(
                 y_cap = min(y_cap, footer_y - 4)
                 y_end = min(y_end, y_cap)
 
+            # Rescue bottom for graphics/tables before text-based shrinking.
+            # This is the key fix for table-choice problems: I/II/III/IV table grids
+            # may not appear as text blocks, but they are visible ink.
+            ink_bottom_y = None
+            ink_bounds_rect = None
+            if protect_graph_table_bottom and y_cap > y_start + 60:
+                full_scan_clip = fitz.Rect(0, y_start, w, y_cap)
+                full_px_bbox = ink_bbox_by_raster(page, full_scan_clip)
+                if full_px_bbox is not None:
+                    ink_bounds_rect = px_bbox_to_page_rect(full_scan_clip, full_px_bbox, pad_px=INK_PAD_PX)
+                    ink_bottom_y = clamp(ink_bounds_rect.y1 + ink_extra_pt, y_start + 60, y_cap)
+
             mcq_last = last_choice_bottom_y_in_band(page, y_start, y_cap)
             if mcq_last is not None:
                 y_end = clamp(max(y_end, mcq_last + 18), y_start + 60, y_cap)
@@ -1044,7 +1075,15 @@ def compute_rects_for_pdf(
             if bottom is not None and bottom > y_start + 80:
                 if mcq_last is not None:
                     bottom = max(bottom, mcq_last + 10)
-                y_end = min(y_end, bottom + 14)
+                text_based_end = bottom + 14
+                if ink_bottom_y is not None:
+                    # Never shrink above the lowest visible graph/table ink.
+                    y_end = min(y_end, max(text_based_end, ink_bottom_y))
+                else:
+                    y_end = min(y_end, text_based_end)
+
+            if ink_bottom_y is not None:
+                y_end = clamp(max(y_end, ink_bottom_y), y_start + 60, y_cap)
 
             # Last question on a page often needs a little more blank space below.
             if i + 1 == len(anchors):
@@ -1057,6 +1096,8 @@ def compute_rects_for_pdf(
                 x0 = clamp(xb[0] - side_pad_pt, 0, w)
                 x1 = clamp(xb[1] + side_pad_pt, x0 + 80, w)
 
+            # Final tight crop over the final vertical band. This removes excess
+            # blank space but now the band already includes lower graph/table ink.
             scan_clip = fitz.Rect(0, y_start, w, y_end)
             px_bbox = ink_bbox_by_raster(page, scan_clip)
             if px_bbox is not None:
@@ -1066,7 +1107,9 @@ def compute_rects_for_pdf(
                 new_y_end = clamp(tight.y1, y_start + 60, y_end)
                 if mcq_last is not None:
                     new_y_end = max(new_y_end, mcq_last + 12)
-                y_end = clamp(new_y_end, y_start + 60, y_end)
+                if ink_bottom_y is not None:
+                    new_y_end = max(new_y_end, ink_bottom_y)
+                y_end = clamp(new_y_end, y_start + 60, y_cap)
 
             rects.append(
                 {
@@ -1079,7 +1122,6 @@ def compute_rects_for_pdf(
             )
 
     return doc, rects
-
 
 def build_full_filename_plan() -> List[Dict[str, Any]]:
     plan = []
@@ -2205,6 +2247,13 @@ with tab1:
         help="켜두면 1. Linear 같은 단원 제목, 1./2./3./4. 번호 선택지, 줄바꿈으로 생긴 '8. What ...' 같은 가짜 anchor를 제외합니다.",
     )
 
+    st.markdown("##### 캡쳐 보정 옵션")
+    opt1, opt2, opt3, opt4 = st.columns(4)
+    exclude_number_line = opt1.checkbox("문제번호 줄 제외", value=True)
+    number_line_offset = opt2.slider("번호 줄 아래 시작 보정", 0, 20, 2, 1)
+    protect_graph_table_bottom = opt3.checkbox("표/그림 아래쪽 잘림 방지", value=True)
+    ink_bottom_extra = opt4.slider("표/그림 아래 여백", 0, 40, 8, 1)
+
     if pdf is not None and st.button("문제별 PNG ZIP 생성", type="primary"):
         try:
             pdf_bytes = pdf.read()
@@ -2217,6 +2266,10 @@ with tab1:
                     last_question_extra_px=last_extra,
                     allow_inline_question_text=allow_inline,
                     require_example_anchor=require_example_anchor,
+                    exclude_question_number_line=exclude_number_line,
+                    number_line_offset=number_line_offset,
+                    protect_graph_table_bottom=protect_graph_table_bottom,
+                    ink_bottom_extra=ink_bottom_extra,
                 )
 
                 if naming_mode == "전체 1255문항: 표 순서대로 자동 이름 붙이기":
