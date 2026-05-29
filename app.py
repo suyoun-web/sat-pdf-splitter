@@ -56,16 +56,18 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 PNG_MIME = "image/png"
 
 DB_HEADERS = [
-    "Code",
-    "UnitName",
-    "QNo",
-    "FileName",
-    "FolderName",
-    "FolderLink",
-    "DriveFileId",
-    "ExpectedCount",
-    "Answer",
-    "Notes",
+    "MajorCode",      # 대단원 코드: 1, 2, 3, ...
+    "MajorName",      # 대단원명: Linear, Geometry, ...
+    "Code",           # 단원코드: 1.1, 1.2, ...
+    "UnitName",       # 단원명
+    "QNo",            # 단원 안 문제번호
+    "FileName",       # 예: 1.1-5.png
+    "FolderName",     # 예: 1.1 Linear function
+    "FolderLink",     # 해당 단원 Drive 폴더 링크
+    "DriveFileId",    # 선택: 개별 PNG 파일 ID
+    "ExpectedCount",  # 표 기준 단원별 전체 문항수
+    "Answer",         # 선택: 정답
+    "Notes",          # 선택: 메모
 ]
 
 # =========================================================
@@ -115,9 +117,39 @@ UNIT_ROWS: List[Tuple[str, str, int]] = [
     ("7.9", "Box plot", 8),
 ]
 
+MAJOR_ROWS: List[Tuple[str, str]] = [
+    ("1", "Linear"),
+    ("2", "Percent & Unit conversion"),
+    ("3", "Quadratic"),
+    ("4", "Exponential"),
+    ("5", "Polynomials, radical and rational functions"),
+    ("6", "Geometry"),
+    ("7", "Statistics"),
+]
+MAJOR_META: Dict[str, str] = {code: name for code, name in MAJOR_ROWS}
+
+
+def major_code_from_unit_code(code: str) -> str:
+    return str(code).strip().split(".")[0] if str(code).strip() else ""
+
+
+def major_name_from_unit_code(code: str) -> str:
+    return MAJOR_META.get(major_code_from_unit_code(code), "")
+
+
 UNIT_DF = pd.DataFrame(UNIT_ROWS, columns=["Code", "UnitName", "ExpectedCount"])
+UNIT_DF["MajorCode"] = UNIT_DF["Code"].map(major_code_from_unit_code)
+UNIT_DF["MajorName"] = UNIT_DF["Code"].map(major_name_from_unit_code)
+UNIT_DF = UNIT_DF[["MajorCode", "MajorName", "Code", "UnitName", "ExpectedCount"]]
+
 UNIT_META: Dict[str, Dict[str, Any]] = {
-    code: {"UnitName": unit, "ExpectedCount": int(cnt)} for code, unit, cnt in UNIT_ROWS
+    row.Code: {
+        "MajorCode": row.MajorCode,
+        "MajorName": row.MajorName,
+        "UnitName": row.UnitName,
+        "ExpectedCount": int(row.ExpectedCount),
+    }
+    for row in UNIT_DF.itertuples()
 }
 TOTAL_EXPECTED = int(UNIT_DF["ExpectedCount"].sum())
 
@@ -215,9 +247,24 @@ def folder_display_name(code: str, unit_name: str) -> str:
     return sanitize_filename(f"{code} {unit_name}")
 
 
+def unit_record_for_code(code: str) -> Dict[str, Any]:
+    """Standard row metadata based on the fixed problem classification table."""
+    meta = UNIT_META.get(code, {})
+    unit_name = meta.get("UnitName", "")
+    return {
+        "MajorCode": meta.get("MajorCode", major_code_from_unit_code(code)),
+        "MajorName": meta.get("MajorName", major_name_from_unit_code(code)),
+        "Code": code,
+        "UnitName": unit_name,
+        "FolderName": folder_display_name(code, unit_name),
+        "ExpectedCount": meta.get("ExpectedCount", ""),
+    }
+
+
 def parse_code_token(token: str) -> Optional[str]:
     s = str(token).strip().replace("_", ".").replace("-", ".")
-    m = re.match(r"^(\d{1,2})\s*\.\s*(\d{1,2})$", s)
+    # Accept both "1.1" and labels like "1.1 Linear function".
+    m = re.search(r"(\d{1,2})\s*\.\s*(\d{1,2})", s)
     if not m:
         return None
     return f"{int(m.group(1))}.{int(m.group(2))}"
@@ -256,7 +303,10 @@ def parse_problem_filename(name: str) -> Optional[Tuple[str, int]]:
 
 
 def get_unit_options() -> List[str]:
-    return [f"{r.Code}  |  {r.UnitName}  ({int(r.ExpectedCount)}문항)" for r in UNIT_DF.itertuples()]
+    return [
+        f"{r.Code}  |  {r.MajorName} > {r.UnitName}  ({int(r.ExpectedCount)}문항)"
+        for r in UNIT_DF.itertuples()
+    ]
 
 
 def label_to_code(label: str) -> Optional[str]:
@@ -463,56 +513,194 @@ def download_drive_file_bytes(file_id: str) -> bytes:
 # Sheet DB helpers
 # =========================================================
 def normalize_db(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize the Google Sheet database so it matches the fixed problem classification.
+
+    Recommended Sheet1 headers:
+      MajorCode, MajorName, Code, UnitName, QNo, FileName, FolderName,
+      FolderLink, DriveFileId, ExpectedCount, Answer, Notes
+
+    Also accepts Korean aliases such as:
+      대단원코드, 대단원명, 단원코드, 단원명, 문항번호, 파일명,
+      폴더명, 폴더링크, 예상문항수, 정답, 메모
+
+    Legacy schema is still supported:
+      Major, Minor, MajorFolder, MinorFolder, FolderLink, FileName, Answer
+    """
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    # New schema
-    if "Code" in df.columns:
-        df["Code"] = df["Code"].apply(lambda x: parse_code_token(x) or str(x).strip())
-    # Old schema support: Major/Minor -> Code
-    elif {"Major", "Minor"}.issubset(df.columns):
-        df["Code"] = df.apply(
-            lambda r: f"{int(float(r['Major']))}.{int(float(r['Minor']))}"
-            if str(r.get("Major", "")).strip() and str(r.get("Minor", "")).strip()
-            else "",
-            axis=1,
-        )
+    aliases = {
+        "대단원코드": "MajorCode",
+        "대단원명": "MajorName",
+        "대분류코드": "MajorCode",
+        "대분류명": "MajorName",
+        "CategoryCode": "MajorCode",
+        "CategoryName": "MajorName",
+        "Major Name": "MajorName",
+        "단원코드": "Code",
+        "UnitCode": "Code",
+        "Unit Code": "Code",
+        "코드": "Code",
+        "단원명": "UnitName",
+        "Unit Name": "UnitName",
+        "문항번호": "QNo",
+        "문제번호": "QNo",
+        "QuestionNo": "QNo",
+        "Question No": "QNo",
+        "No": "QNo",
+        "파일명": "FileName",
+        "File": "FileName",
+        "ImageName": "FileName",
+        "Image Name": "FileName",
+        "폴더명": "FolderName",
+        "Folder Name": "FolderName",
+        "폴더링크": "FolderLink",
+        "Folder Link": "FolderLink",
+        "DriveFolderLink": "FolderLink",
+        "Drive Folder Link": "FolderLink",
+        "Drive File ID": "DriveFileId",
+        "DriveFileID": "DriveFileId",
+        "파일ID": "DriveFileId",
+        "예상문항수": "ExpectedCount",
+        "문항수": "ExpectedCount",
+        "Expected Count": "ExpectedCount",
+        "정답": "Answer",
+        "답": "Answer",
+        "메모": "Notes",
+        "비고": "Notes",
+    }
 
+    # Rename aliases safely. If two columns map to the same canonical name, keep the first.
+    new_cols = []
+    seen = set()
+    for col in df.columns:
+        canonical = aliases.get(col, col)
+        if canonical in seen:
+            canonical = col
+        new_cols.append(canonical)
+        seen.add(canonical)
+    df.columns = new_cols
+
+    def clean_text(v: Any) -> str:
+        s = str(v or "").strip()
+        return "" if s.lower() in {"nan", "none", "<na>"} else s
+
+    def normalize_major_code(raw: Any, unit_code: str = "") -> str:
+        s = clean_text(raw)
+        roman_map = {"I": "1", "II": "2", "III": "3", "IV": "4", "V": "5", "VI": "6", "VII": "7"}
+        m = re.match(r"^(\d{1,2})", s)
+        if m:
+            return str(int(m.group(1)))
+        m = re.match(r"^([IVX]+)\b", s.upper())
+        if m and m.group(1) in roman_map:
+            return roman_map[m.group(1)]
+        return major_code_from_unit_code(unit_code)
+
+    # Build Code from Code / legacy Major+Minor / FileName.
+    if "Code" in df.columns:
+        df["Code"] = df["Code"].apply(lambda x: parse_code_token(x) or "")
+    elif {"Major", "Minor"}.issubset(df.columns):
+        def mm_to_code(r):
+            try:
+                if clean_text(r.get("Major", "")) and clean_text(r.get("Minor", "")):
+                    return f"{int(float(r['Major']))}.{int(float(r['Minor']))}"
+            except Exception:
+                return ""
+            return ""
+        df["Code"] = df.apply(mm_to_code, axis=1)
+    elif "FileName" in df.columns:
+        df["Code"] = df["FileName"].apply(lambda x: parse_problem_filename(x)[0] if parse_problem_filename(x) else "")
+    else:
+        df["Code"] = ""
+
+    # FileName can be omitted if Code + QNo exist; otherwise it can drive Code/QNo.
+    if "FileName" not in df.columns:
+        if "QNo" in df.columns:
+            df["FileName"] = df.apply(
+                lambda r: f"{r.get('Code','')}-{int(float(r.get('QNo', 0)))}.png"
+                if clean_text(r.get("Code", "")) and clean_text(r.get("QNo", ""))
+                else "",
+                axis=1,
+            )
+        else:
+            df["FileName"] = ""
+    df["FileName"] = df["FileName"].apply(ensure_png_filename)
+
+    if "QNo" not in df.columns:
+        df["QNo"] = df["FileName"].apply(lambda x: parse_problem_filename(x)[1] if parse_problem_filename(x) else None)
+    else:
+        def fill_qno(r):
+            q = clean_text(r.get("QNo", ""))
+            if q:
+                return q
+            parsed = parse_problem_filename(r.get("FileName", ""))
+            return parsed[1] if parsed else None
+        df["QNo"] = df.apply(fill_qno, axis=1)
+
+    # Fill unit/major metadata from the fixed 1.1–7.9 classification table.
     if "UnitName" not in df.columns:
         if "MinorFolder" in df.columns:
             df["UnitName"] = df["MinorFolder"].astype(str)
         else:
-            df["UnitName"] = df["Code"].map(lambda c: UNIT_META.get(c, {}).get("UnitName", ""))
+            df["UnitName"] = ""
+    df["UnitName"] = df.apply(
+        lambda r: clean_text(r.get("UnitName", "")) or UNIT_META.get(r.get("Code", ""), {}).get("UnitName", ""),
+        axis=1,
+    )
+
+    if "MajorCode" not in df.columns:
+        df["MajorCode"] = ""
+    df["MajorCode"] = df.apply(lambda r: normalize_major_code(r.get("MajorCode", ""), r.get("Code", "")), axis=1)
+
+    if "MajorName" not in df.columns:
+        if "MajorFolder" in df.columns:
+            df["MajorName"] = df["MajorFolder"].astype(str)
+        else:
+            df["MajorName"] = ""
+    df["MajorName"] = df.apply(
+        lambda r: clean_text(r.get("MajorName", "")) or MAJOR_META.get(clean_text(r.get("MajorCode", "")), "") or major_name_from_unit_code(r.get("Code", "")),
+        axis=1,
+    )
 
     if "ExpectedCount" not in df.columns:
-        df["ExpectedCount"] = df["Code"].map(lambda c: UNIT_META.get(c, {}).get("ExpectedCount", ""))
-
-    if "FileName" not in df.columns:
-        df["FileName"] = df.apply(
-            lambda r: f"{r.get('Code','')}-{int(float(r.get('QNo', 0)))}.png"
-            if str(r.get("Code", "")).strip() and str(r.get("QNo", "")).strip()
-            else "",
-            axis=1,
-        )
-
-    if "QNo" not in df.columns:
-        df["QNo"] = df["FileName"].apply(lambda x: parse_problem_filename(x)[1] if parse_problem_filename(x) else None)
+        df["ExpectedCount"] = ""
+    df["ExpectedCount"] = df.apply(
+        lambda r: clean_text(r.get("ExpectedCount", "")) or UNIT_META.get(r.get("Code", ""), {}).get("ExpectedCount", ""),
+        axis=1,
+    )
 
     if "FolderName" not in df.columns:
-        df["FolderName"] = df.apply(lambda r: folder_display_name(r.get("Code", ""), r.get("UnitName", "")), axis=1)
+        if "MinorFolder" in df.columns:
+            df["FolderName"] = df["MinorFolder"].astype(str)
+        else:
+            df["FolderName"] = ""
+    df["FolderName"] = df.apply(
+        lambda r: clean_text(r.get("FolderName", "")) or folder_display_name(r.get("Code", ""), r.get("UnitName", "")),
+        axis=1,
+    )
 
     for c in DB_HEADERS:
         if c not in df.columns:
             df[c] = ""
 
     df = df[DB_HEADERS].copy()
+    df["Code"] = df["Code"].astype(str).str.strip()
+    df["MajorCode"] = df["MajorCode"].astype(str).str.strip()
     df["QNo"] = pd.to_numeric(df["QNo"], errors="coerce").astype("Int64")
     df["ExpectedCount"] = pd.to_numeric(df["ExpectedCount"], errors="coerce").astype("Int64")
-    df = df[df["Code"].isin(UNIT_META.keys())]
-    df = df[df["FileName"].astype(str).str.strip() != ""]
-    df = df.sort_values(["Code", "QNo"], key=lambda col: col.map(sort_code_key) if col.name == "Code" else col)
-    return df.reset_index(drop=True)
+    df["FileName"] = df["FileName"].astype(str).apply(ensure_png_filename)
 
+    for c in ["MajorName", "UnitName", "FolderName", "FolderLink", "DriveFileId", "Answer", "Notes"]:
+        df[c] = df[c].astype(str).replace({"nan": "", "None": "", "<NA>": ""})
+
+    df = df[df["Code"].isin(UNIT_META.keys())]
+    df = df.sort_values(
+        ["Code", "QNo"],
+        key=lambda col: col.map(sort_code_key) if col.name == "Code" else col,
+        na_position="last",
+    )
+    return df.reset_index(drop=True)
 
 def sort_code_key(code: str) -> Tuple[int, int]:
     parsed = parse_code_token(code)
@@ -639,6 +827,7 @@ def detect_question_anchors(
 
         x_left = min(t[0] for t in tokens)
         y_top = min(t[1] for t in tokens)
+        y_bottom = max(t[3] for t in tokens)
         if x_left > w_page * left_ratio:
             continue
         if y_top > h_page * 0.96:
@@ -662,6 +851,7 @@ def detect_question_anchors(
                 if m:
                     qnum = int(m.group(1))
                     y_top = y0
+                    y_bottom = y1
                     break
 
         if qnum is None:
@@ -670,15 +860,18 @@ def detect_question_anchors(
         if not allow_inline_question_text and len(compact) > max_line_chars:
             continue
 
-        anchors.append((qnum, y_top))
+        # Save both the top and bottom of the number/anchor line.
+        # The crop engine can start from the NEXT line so the printed number
+        # itself is not included in the final PNG.
+        anchors.append((qnum, y_top, y_bottom))
 
     # Deduplicate anchors very close to each other
     anchors.sort(key=lambda t: t[1])
     deduped = []
-    for q, y in anchors:
-        if deduped and abs(y - deduped[-1][1]) < 3:
+    for q, y_top, y_bottom in anchors:
+        if deduped and abs(y_top - deduped[-1][1]) < 3:
             continue
-        deduped.append((q, y))
+        deduped.append((q, y_top, y_bottom))
     return deduped
 
 
@@ -825,8 +1018,10 @@ def compute_rects_for_pdf(
         if not anchors:
             continue
 
-        for i, (printed_qnum, y0) in enumerate(anchors):
-            y_start = clamp(y0 - pad_top, 0, h)
+        for i, (printed_qnum, y0, y0_bottom) in enumerate(anchors):
+            # Start the crop BELOW the number/anchor line so the printed
+            # question number is excluded from the saved PNG.
+            y_start = clamp(y0_bottom + 2, 0, h)
 
             if i + 1 < len(anchors):
                 next_y = anchors[i + 1][1]
@@ -891,15 +1086,13 @@ def build_full_filename_plan() -> List[Dict[str, Any]]:
     order = 1
     for code, unit_name, cnt in UNIT_ROWS:
         for qno in range(1, cnt + 1):
+            meta = unit_record_for_code(code)
             plan.append(
                 {
                     "order": order,
-                    "Code": code,
-                    "UnitName": unit_name,
+                    **meta,
                     "QNo": qno,
                     "FileName": f"{code}-{qno}.png",
-                    "FolderName": folder_display_name(code, unit_name),
-                    "ExpectedCount": cnt,
                 }
             )
             order += 1
@@ -907,16 +1100,13 @@ def build_full_filename_plan() -> List[Dict[str, Any]]:
 
 
 def build_single_unit_filename_plan(code: str, count: int) -> List[Dict[str, Any]]:
-    meta = UNIT_META[code]
+    meta = unit_record_for_code(code)
     return [
         {
             "order": i,
-            "Code": code,
-            "UnitName": meta["UnitName"],
+            **meta,
             "QNo": i,
             "FileName": f"{code}-{i}.png",
-            "FolderName": folder_display_name(code, meta["UnitName"]),
-            "ExpectedCount": meta["ExpectedCount"],
         }
         for i in range(1, count + 1)
     ]
@@ -933,16 +1123,13 @@ def read_mapping_csv(uploaded_file) -> List[Dict[str, Any]]:
         if not parsed:
             continue
         code, qno = parsed
-        meta = UNIT_META.get(code, {"UnitName": "", "ExpectedCount": ""})
+        meta = unit_record_for_code(code)
         plan.append(
             {
                 "order": int(row.get("order") or row.get("Order") or idx),
-                "Code": code,
-                "UnitName": meta["UnitName"],
+                **meta,
                 "QNo": qno,
                 "FileName": f"{code}-{qno}.png",
-                "FolderName": folder_display_name(code, meta["UnitName"]),
-                "ExpectedCount": meta["ExpectedCount"],
             }
         )
     plan.sort(key=lambda x: x["order"])
@@ -972,6 +1159,8 @@ def make_zip_from_rects(
             else:
                 meta = {
                     "order": i + 1,
+                    "MajorCode": "",
+                    "MajorName": "",
                     "Code": "UNMAPPED",
                     "UnitName": "Unmapped",
                     "QNo": i + 1,
@@ -998,6 +1187,8 @@ def make_zip_from_rects(
                     "Order": i + 1,
                     "PrintedQNo": r.get("printed_qnum", ""),
                     "Page": int(r["page"]) + 1,
+                    "MajorCode": meta.get("MajorCode", ""),
+                    "MajorName": meta.get("MajorName", ""),
                     "Code": meta["Code"],
                     "UnitName": meta["UnitName"],
                     "QNo": meta["QNo"],
@@ -1056,6 +1247,8 @@ def upload_zip_to_drive_and_build_rows(
             continue
         unit_name = meta["UnitName"]
         expected_count = meta["ExpectedCount"]
+        major_code = meta.get("MajorCode", major_code_from_unit_code(code))
+        major_name = meta.get("MajorName", major_name_from_unit_code(code))
         fname = folder_display_name(code, unit_name)
         if code not in folder_cache:
             folder_cache[code] = get_or_create_child_folder(root_folder_id, fname)
@@ -1064,6 +1257,8 @@ def upload_zip_to_drive_and_build_rows(
         file_id = upload_or_update_png(folder_id, filename, data, overwrite=overwrite)
         rows.append(
             {
+                "MajorCode": major_code,
+                "MajorName": major_name,
                 "Code": code,
                 "UnitName": unit_name,
                 "QNo": qno,
@@ -1323,37 +1518,112 @@ def ensure_png_filename(value: str) -> str:
 
 def normalize_db(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Supports both schemas:
-      New: Code, UnitName, QNo, FileName, FolderName, FolderLink, DriveFileId, ExpectedCount, Answer, Notes
-      Old: Major, Minor, MajorFolder, MinorFolder, FolderLink, FileName, Answer
-    FileName may be either '1.1-5' or '1.1-5.png'.
+    Normalize the Google Sheet database so it matches the fixed problem classification.
+
+    Recommended Sheet1 headers:
+      MajorCode, MajorName, Code, UnitName, QNo, FileName, FolderName,
+      FolderLink, DriveFileId, ExpectedCount, Answer, Notes
+
+    Also accepts Korean aliases such as:
+      대단원코드, 대단원명, 단원코드, 단원명, 문항번호, 파일명,
+      폴더명, 폴더링크, 예상문항수, 정답, 메모
+
+    Legacy schema is still supported:
+      Major, Minor, MajorFolder, MinorFolder, FolderLink, FileName, Answer
     """
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
+    aliases = {
+        "대단원코드": "MajorCode",
+        "대단원명": "MajorName",
+        "대분류코드": "MajorCode",
+        "대분류명": "MajorName",
+        "CategoryCode": "MajorCode",
+        "CategoryName": "MajorName",
+        "Major Name": "MajorName",
+        "단원코드": "Code",
+        "UnitCode": "Code",
+        "Unit Code": "Code",
+        "코드": "Code",
+        "단원명": "UnitName",
+        "Unit Name": "UnitName",
+        "문항번호": "QNo",
+        "문제번호": "QNo",
+        "QuestionNo": "QNo",
+        "Question No": "QNo",
+        "No": "QNo",
+        "파일명": "FileName",
+        "File": "FileName",
+        "ImageName": "FileName",
+        "Image Name": "FileName",
+        "폴더명": "FolderName",
+        "Folder Name": "FolderName",
+        "폴더링크": "FolderLink",
+        "Folder Link": "FolderLink",
+        "DriveFolderLink": "FolderLink",
+        "Drive Folder Link": "FolderLink",
+        "Drive File ID": "DriveFileId",
+        "DriveFileID": "DriveFileId",
+        "파일ID": "DriveFileId",
+        "예상문항수": "ExpectedCount",
+        "문항수": "ExpectedCount",
+        "Expected Count": "ExpectedCount",
+        "정답": "Answer",
+        "답": "Answer",
+        "메모": "Notes",
+        "비고": "Notes",
+    }
+
+    # Rename aliases safely. If two columns map to the same canonical name, keep the first.
+    new_cols = []
+    seen = set()
+    for col in df.columns:
+        canonical = aliases.get(col, col)
+        if canonical in seen:
+            canonical = col
+        new_cols.append(canonical)
+        seen.add(canonical)
+    df.columns = new_cols
+
+    def clean_text(v: Any) -> str:
+        s = str(v or "").strip()
+        return "" if s.lower() in {"nan", "none", "<na>"} else s
+
+    def normalize_major_code(raw: Any, unit_code: str = "") -> str:
+        s = clean_text(raw)
+        roman_map = {"I": "1", "II": "2", "III": "3", "IV": "4", "V": "5", "VI": "6", "VII": "7"}
+        m = re.match(r"^(\d{1,2})", s)
+        if m:
+            return str(int(m.group(1)))
+        m = re.match(r"^([IVX]+)\b", s.upper())
+        if m and m.group(1) in roman_map:
+            return roman_map[m.group(1)]
+        return major_code_from_unit_code(unit_code)
+
+    # Build Code from Code / legacy Major+Minor / FileName.
     if "Code" in df.columns:
         df["Code"] = df["Code"].apply(lambda x: parse_code_token(x) or "")
     elif {"Major", "Minor"}.issubset(df.columns):
         def mm_to_code(r):
             try:
-                if str(r.get("Major", "")).strip() and str(r.get("Minor", "")).strip():
+                if clean_text(r.get("Major", "")) and clean_text(r.get("Minor", "")):
                     return f"{int(float(r['Major']))}.{int(float(r['Minor']))}"
             except Exception:
                 return ""
             return ""
         df["Code"] = df.apply(mm_to_code, axis=1)
+    elif "FileName" in df.columns:
+        df["Code"] = df["FileName"].apply(lambda x: parse_problem_filename(x)[0] if parse_problem_filename(x) else "")
     else:
-        # Last fallback: parse code from FileName if possible.
-        if "FileName" in df.columns:
-            df["Code"] = df["FileName"].apply(lambda x: parse_problem_filename(x)[0] if parse_problem_filename(x) else "")
-        else:
-            df["Code"] = ""
+        df["Code"] = ""
 
+    # FileName can be omitted if Code + QNo exist; otherwise it can drive Code/QNo.
     if "FileName" not in df.columns:
         if "QNo" in df.columns:
             df["FileName"] = df.apply(
                 lambda r: f"{r.get('Code','')}-{int(float(r.get('QNo', 0)))}.png"
-                if str(r.get("Code", "")).strip() and str(r.get("QNo", "")).strip()
+                if clean_text(r.get("Code", "")) and clean_text(r.get("QNo", ""))
                 else "",
                 axis=1,
             )
@@ -1364,33 +1634,55 @@ def normalize_db(df: pd.DataFrame) -> pd.DataFrame:
     if "QNo" not in df.columns:
         df["QNo"] = df["FileName"].apply(lambda x: parse_problem_filename(x)[1] if parse_problem_filename(x) else None)
     else:
-        # Fill missing QNo from filename.
         def fill_qno(r):
-            q = r.get("QNo", "")
-            if str(q).strip() and str(q).strip().lower() not in {"nan", "none"}:
+            q = clean_text(r.get("QNo", ""))
+            if q:
                 return q
             parsed = parse_problem_filename(r.get("FileName", ""))
             return parsed[1] if parsed else None
         df["QNo"] = df.apply(fill_qno, axis=1)
 
+    # Fill unit/major metadata from the fixed 1.1–7.9 classification table.
     if "UnitName" not in df.columns:
         if "MinorFolder" in df.columns:
             df["UnitName"] = df["MinorFolder"].astype(str)
         else:
-            df["UnitName"] = df["Code"].map(lambda c: UNIT_META.get(c, {}).get("UnitName", ""))
+            df["UnitName"] = ""
     df["UnitName"] = df.apply(
-        lambda r: str(r.get("UnitName", "")).strip() or UNIT_META.get(r.get("Code", ""), {}).get("UnitName", ""),
+        lambda r: clean_text(r.get("UnitName", "")) or UNIT_META.get(r.get("Code", ""), {}).get("UnitName", ""),
+        axis=1,
+    )
+
+    if "MajorCode" not in df.columns:
+        df["MajorCode"] = ""
+    df["MajorCode"] = df.apply(lambda r: normalize_major_code(r.get("MajorCode", ""), r.get("Code", "")), axis=1)
+
+    if "MajorName" not in df.columns:
+        if "MajorFolder" in df.columns:
+            df["MajorName"] = df["MajorFolder"].astype(str)
+        else:
+            df["MajorName"] = ""
+    df["MajorName"] = df.apply(
+        lambda r: clean_text(r.get("MajorName", "")) or MAJOR_META.get(clean_text(r.get("MajorCode", "")), "") or major_name_from_unit_code(r.get("Code", "")),
         axis=1,
     )
 
     if "ExpectedCount" not in df.columns:
-        df["ExpectedCount"] = df["Code"].map(lambda c: UNIT_META.get(c, {}).get("ExpectedCount", ""))
+        df["ExpectedCount"] = ""
+    df["ExpectedCount"] = df.apply(
+        lambda r: clean_text(r.get("ExpectedCount", "")) or UNIT_META.get(r.get("Code", ""), {}).get("ExpectedCount", ""),
+        axis=1,
+    )
 
     if "FolderName" not in df.columns:
         if "MinorFolder" in df.columns:
             df["FolderName"] = df["MinorFolder"].astype(str)
         else:
-            df["FolderName"] = df.apply(lambda r: folder_display_name(r.get("Code", ""), r.get("UnitName", "")), axis=1)
+            df["FolderName"] = ""
+    df["FolderName"] = df.apply(
+        lambda r: clean_text(r.get("FolderName", "")) or folder_display_name(r.get("Code", ""), r.get("UnitName", "")),
+        axis=1,
+    )
 
     for c in DB_HEADERS:
         if c not in df.columns:
@@ -1398,16 +1690,21 @@ def normalize_db(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df[DB_HEADERS].copy()
     df["Code"] = df["Code"].astype(str).str.strip()
+    df["MajorCode"] = df["MajorCode"].astype(str).str.strip()
     df["QNo"] = pd.to_numeric(df["QNo"], errors="coerce").astype("Int64")
     df["ExpectedCount"] = pd.to_numeric(df["ExpectedCount"], errors="coerce").astype("Int64")
     df["FileName"] = df["FileName"].astype(str).apply(ensure_png_filename)
-    for c in ["FolderLink", "DriveFileId", "Answer", "Notes", "FolderName", "UnitName"]:
-        df[c] = df[c].astype(str).replace({"nan": "", "None": ""})
+
+    for c in ["MajorName", "UnitName", "FolderName", "FolderLink", "DriveFileId", "Answer", "Notes"]:
+        df[c] = df[c].astype(str).replace({"nan": "", "None": "", "<NA>": ""})
 
     df = df[df["Code"].isin(UNIT_META.keys())]
-    df = df.sort_values(["Code", "QNo"], key=lambda col: col.map(sort_code_key) if col.name == "Code" else col)
+    df = df.sort_values(
+        ["Code", "QNo"],
+        key=lambda col: col.map(sort_code_key) if col.name == "Code" else col,
+        na_position="last",
+    )
     return df.reset_index(drop=True)
-
 
 def first_nonempty(series: pd.Series) -> str:
     for v in series.tolist():
@@ -1656,6 +1953,185 @@ def make_packet_pdf(title: str, items: List[PacketItem], page_size_name: str = "
     return out.getvalue()
 
 
+
+
+# =========================================================
+# Minimal Sheet1 DB support override
+# =========================================================
+# ✅ 가장 간단한 Sheet1 헤더
+# 1) 단원별 폴더만 관리할 때: Code | FolderLink
+# 2) 문제별 정답까지 관리할 때: FileName | FolderLink | Answer
+#
+# 앱 내부에서는 단원표(1.1–7.9)를 이미 알고 있으므로,
+# MajorName / UnitName / ExpectedCount / QNo는 자동으로 채웁니다.
+SIMPLE_FOLDER_DB_HEADERS = ["Code", "FolderLink"]
+SIMPLE_FILE_DB_HEADERS = ["FileName", "FolderLink", "Answer"]
+
+
+def _clean_db_text(value: Any) -> str:
+    s = str(value or "").strip()
+    return "" if s.lower() in {"nan", "none", "<na>"} else s
+
+
+def _first_clean(values) -> str:
+    for v in list(values):
+        s = _clean_db_text(v)
+        if s:
+            return s
+    return ""
+
+
+def normalize_db(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sheet1 can now be very simple.
+
+    Minimal option A, one row per unit folder:
+      Code | FolderLink
+      1.1  | https://drive.google.com/drive/folders/...
+
+    Minimal option B, one row per problem if you want answer keys:
+      FileName | FolderLink | Answer
+      1.1-5.png | https://drive.google.com/drive/folders/... | C
+
+    Accepted optional columns:
+      Code, FileName, FolderLink, DriveFileId, Answer, Notes
+
+    The app automatically infers:
+      MajorCode, MajorName, UnitName, QNo, FolderName, ExpectedCount
+    """
+    df = df.copy()
+    if df.empty and len(df.columns) == 0:
+        return pd.DataFrame(columns=DB_HEADERS)
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    aliases = {
+        "단원코드": "Code", "코드": "Code", "UnitCode": "Code", "Unit Code": "Code", "unit_code": "Code",
+        "파일명": "FileName", "문제파일": "FileName", "이미지파일": "FileName", "File": "FileName",
+        "ImageName": "FileName", "Image Name": "FileName", "file_name": "FileName",
+        "폴더링크": "FolderLink", "폴더 링크": "FolderLink", "Drive폴더링크": "FolderLink",
+        "Drive Folder Link": "FolderLink", "DriveFolderLink": "FolderLink", "Folder Link": "FolderLink",
+        "FolderURL": "FolderLink", "Folder URL": "FolderLink", "Link": "FolderLink", "링크": "FolderLink",
+        "Drive File ID": "DriveFileId", "DriveFileID": "DriveFileId", "FileId": "DriveFileId",
+        "File ID": "DriveFileId", "파일ID": "DriveFileId",
+        "정답": "Answer", "답": "Answer", "메모": "Notes", "비고": "Notes",
+        "대단원코드": "MajorCode", "대단원명": "MajorName", "단원명": "UnitName",
+        "문항번호": "QNo", "문제번호": "QNo", "No": "QNo", "문항수": "ExpectedCount",
+        "예상문항수": "ExpectedCount", "폴더명": "FolderName",
+    }
+
+    renamed = []
+    seen = set()
+    for col in df.columns:
+        canonical = aliases.get(col, col)
+        if canonical in seen:
+            canonical = col
+        renamed.append(canonical)
+        seen.add(canonical)
+    df.columns = renamed
+
+    for c in ["Code", "FileName", "QNo", "FolderLink", "DriveFileId", "Answer", "Notes"]:
+        if c not in df.columns:
+            df[c] = ""
+
+    df["FileName"] = df["FileName"].astype(str).apply(ensure_png_filename)
+
+    def code_from_row(r) -> str:
+        code = parse_code_token(r.get("Code", ""))
+        if code:
+            return code
+        parsed = parse_problem_filename(r.get("FileName", ""))
+        return parsed[0] if parsed else ""
+
+    def qno_from_row(r):
+        q = _clean_db_text(r.get("QNo", ""))
+        if q:
+            try:
+                return int(float(q))
+            except Exception:
+                return q
+        parsed = parse_problem_filename(r.get("FileName", ""))
+        return parsed[1] if parsed else None
+
+    df["Code"] = df.apply(code_from_row, axis=1)
+    df["QNo"] = df.apply(qno_from_row, axis=1)
+    df = df[df["Code"].isin(UNIT_META.keys())].copy()
+
+    df["MajorCode"] = df["Code"].map(lambda c: UNIT_META.get(c, {}).get("MajorCode", major_code_from_unit_code(c)))
+    df["MajorName"] = df["Code"].map(lambda c: UNIT_META.get(c, {}).get("MajorName", major_name_from_unit_code(c)))
+    df["UnitName"] = df["Code"].map(lambda c: UNIT_META.get(c, {}).get("UnitName", ""))
+    df["ExpectedCount"] = df["Code"].map(lambda c: UNIT_META.get(c, {}).get("ExpectedCount", ""))
+    df["FolderName"] = df.apply(lambda r: folder_display_name(r.get("Code", ""), r.get("UnitName", "")), axis=1)
+
+    link_by_code = df.groupby("Code")["FolderLink"].apply(_first_clean).to_dict() if not df.empty else {}
+    df["FolderLink"] = df.apply(
+        lambda r: _clean_db_text(r.get("FolderLink", "")) or link_by_code.get(r.get("Code", ""), ""),
+        axis=1,
+    )
+
+    for c in DB_HEADERS:
+        if c not in df.columns:
+            df[c] = ""
+
+    df = df[DB_HEADERS].copy()
+    df["Code"] = df["Code"].astype(str).str.strip()
+    df["MajorCode"] = df["MajorCode"].astype(str).str.strip()
+    df["QNo"] = pd.to_numeric(df["QNo"], errors="coerce").astype("Int64")
+    df["ExpectedCount"] = pd.to_numeric(df["ExpectedCount"], errors="coerce").astype("Int64")
+    df["FileName"] = df["FileName"].astype(str).apply(ensure_png_filename)
+    for c in ["MajorName", "UnitName", "FolderName", "FolderLink", "DriveFileId", "Answer", "Notes"]:
+        df[c] = df[c].astype(str).replace({"nan": "", "None": "", "<NA>": ""})
+
+    df = df.sort_values(
+        ["Code", "QNo", "FileName"],
+        key=lambda col: col.map(sort_code_key) if col.name == "Code" else col,
+        na_position="last",
+    )
+    return df.reset_index(drop=True)
+
+
+def count_available_pngs_by_code(df_db: pd.DataFrame, use_drive_folders: bool = True) -> Tuple[pd.DataFrame, List[str]]:
+    """Count recognized problems from FileName rows, or from Drive folders for Code|FolderLink minimal DB."""
+    warnings: List[str] = []
+    file_rows = df_db[df_db["FileName"].astype(str).str.strip() != ""].copy()
+    file_counts = file_rows.groupby("Code").size().to_dict() if not file_rows.empty else {}
+
+    rows = []
+    for unit in UNIT_DF.itertuples():
+        code = unit.Code
+        db_count = int(file_counts.get(code, 0))
+        drive_count = None
+
+        if use_drive_folders and db_count == 0:
+            subset = df_db[df_db["Code"] == code].copy()
+            folder_link = first_nonempty(subset.get("FolderLink", pd.Series(dtype=str))) if not subset.empty else ""
+            if folder_link:
+                try:
+                    folder_id = extract_folder_id(folder_link)
+                    file_map = list_png_files_in_folder(folder_id)
+                    matching = [name for name in file_map if parse_problem_filename(name) and parse_problem_filename(name)[0] == code]
+                    drive_count = len(matching) if matching else len(file_map)
+                except Exception as e:
+                    warnings.append(f"{code} {unit.UnitName}: Drive 폴더 파일 수 확인 실패 ({e})")
+
+        available = db_count if db_count > 0 else int(drive_count or 0)
+        missing = int(unit.ExpectedCount) - available
+        rows.append({
+            "MajorCode": unit.MajorCode,
+            "MajorName": unit.MajorName,
+            "Code": code,
+            "UnitName": unit.UnitName,
+            "ExpectedCount": int(unit.ExpectedCount),
+            "SheetFileNameRows": db_count,
+            "DriveFolderPNGCount": "" if drive_count is None else int(drive_count),
+            "RecognizedCount": available,
+            "Missing": missing,
+            "Status": "OK" if missing == 0 else ("부족" if missing > 0 else "초과"),
+        })
+
+    return pd.DataFrame(rows), warnings
+
+
 # =========================================================
 # UI
 # =========================================================
@@ -1673,7 +2149,7 @@ with st.sidebar:
     st.divider()
     st.header("기본 설정")
     sheet_id = st.text_input("Google Sheet ID", value=sheet_id)
-    st.caption("Sheet1 DB만 읽습니다. ZIP 자동 Drive 업로드 기능은 뺐어요.")
+    st.caption("Sheet1 DB는 최소형 헤더도 인식합니다: Code|FolderLink 또는 FileName|FolderLink|Answer")
     st.markdown("**필요한 폰트 경로**  ")
     st.code("assets/fonts/NotoSansKR-VariableFont_wght.ttf")
     if st.button("캐시 새로고침"):
@@ -1808,10 +2284,11 @@ with tab2:
         st.stop()
 
     if df_db.empty:
-        st.warning("Sheet1 DB가 비어 있어요. Drive에 직접 업로드한 뒤 Sheet1에 FileName/Code/FolderLink 정보를 넣어줘.")
+        st.warning("Sheet1 DB가 비어 있어요. 최소형은 Code / FolderLink 두 컬럼만 넣어도 됩니다.")
         st.stop()
 
     with st.expander("현재 Sheet1에서 읽은 DB 미리보기", expanded=False):
+        st.info("최소형 Sheet1 헤더: Code | FolderLink  /  정답까지 넣을 때: FileName | FolderLink | Answer")
         st.dataframe(df_db.head(80), use_container_width=True, hide_index=True)
 
     col1, col2 = st.columns(2)
@@ -1870,15 +2347,19 @@ with tab3:
     if df_db_check.empty:
         st.warning("DB가 비어 있습니다.")
     else:
-        file_rows = df_db_check[df_db_check["FileName"].astype(str).str.strip() != ""].copy()
-        actual = file_rows.groupby("Code").size().reset_index(name="DBFileNameCount")
-        check = UNIT_DF.merge(actual, on="Code", how="left")
-        check["DBFileNameCount"] = check["DBFileNameCount"].fillna(0).astype(int)
-        check["Missing"] = check["ExpectedCount"] - check["DBFileNameCount"]
-        check["Status"] = check["Missing"].apply(lambda x: "OK" if x == 0 else ("부족" if x > 0 else "초과"))
-        st.metric("Sheet1 FileName 행 수", int(check["DBFileNameCount"].sum()))
+        use_drive_folder_counts = st.checkbox(
+            "Code | FolderLink 최소형 DB일 때 Drive 폴더 안 PNG 개수까지 세기",
+            value=True,
+            help="Sheet1에 FileName 행이 없고 Code와 FolderLink만 있을 때, Drive 폴더 안의 PNG 파일 수로 점검합니다.",
+        )
+        check, count_warnings = count_available_pngs_by_code(df_db_check, use_drive_folders=use_drive_folder_counts)
+        st.metric("인식 가능한 문제 수", int(check["RecognizedCount"].sum()))
         st.metric("표 기준 총 문항수", TOTAL_EXPECTED)
         st.dataframe(check, use_container_width=True, hide_index=True)
+
+        if count_warnings:
+            with st.expander("Drive 폴더 점검 경고"):
+                st.write("\n".join(count_warnings))
 
         bad = check[check["Status"] != "OK"]
         if not bad.empty:
