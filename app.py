@@ -891,6 +891,82 @@ def last_choice_bottom_y_in_band(page, y_from, y_to):
     return max(bottoms) if bottoms else None
 
 
+def vertical_choice_protection_bottom_y(
+    page,
+    y_from,
+    y_cap,
+    zoom: float,
+    bottom_extra_px: int = 18,
+):
+    """Estimate a safe lower bound for tall A/B/C/D image-choice questions.
+
+    Some SAT problems show A), B), C), D) as a vertical stack where each option
+    is a small graph/scatterplot image. Text-only bottom detection may stop near
+    the D) label and cut off the graph below it. This helper finds ordered
+    A/B/C/D labels and extends the crop below D by roughly the same vertical
+    spacing as the earlier choices. It also raster-scans the D-choice band to
+    include visible graph ink when possible.
+    """
+    label_variants = {
+        "A": ["A)", "(A)", "A."],
+        "B": ["B)", "(B)", "B."],
+        "C": ["C)", "(C)", "C."],
+        "D": ["D)", "(D)", "D."],
+    }
+
+    positions = {}
+    for key, labs in label_variants.items():
+        rects = []
+        for lab in labs:
+            try:
+                rects.extend(page.search_for(lab))
+            except Exception:
+                pass
+        rects = [r for r in rects if (r.y1 >= y_from and r.y0 <= y_cap)]
+        if rects:
+            # Use the first occurrence in this question band.
+            positions[key] = sorted(rects, key=lambda r: (r.y0, r.x0))[0]
+
+    if not all(k in positions for k in ["A", "B", "C", "D"]):
+        return None
+
+    ys = [positions[k].y0 for k in ["A", "B", "C", "D"]]
+    # Must be clearly ordered from top to bottom.
+    if not (ys[0] < ys[1] < ys[2] < ys[3]):
+        return None
+
+    gaps = [ys[i + 1] - ys[i] for i in range(3)]
+    # If labels are almost on the same horizontal row, this is not a vertical stack.
+    if max(gaps) < 25:
+        return None
+
+    gaps_sorted = sorted(gaps)
+    median_gap = gaps_sorted[len(gaps_sorted) // 2]
+    bottom_extra_pt = bottom_extra_px / max(zoom, 0.1)
+
+    d_top = positions["D"].y0
+    d_bottom = positions["D"].y1
+
+    # Conservative estimate: D option usually occupies about one option interval.
+    estimated_bottom = d_top + median_gap + bottom_extra_pt
+
+    # Raster scan from D label down to the cap to include actual graph ink.
+    ink_bottom = None
+    scan_start = max(y_from, d_top - 6)
+    if y_cap > scan_start + 20:
+        scan_clip = fitz.Rect(0, scan_start, page.rect.width, y_cap)
+        px_bbox = ink_bbox_by_raster(page, scan_clip)
+        if px_bbox is not None:
+            ink_rect = px_bbox_to_page_rect(scan_clip, px_bbox, pad_px=INK_PAD_PX)
+            ink_bottom = ink_rect.y1 + bottom_extra_pt
+
+    target = max(d_bottom + bottom_extra_pt, estimated_bottom)
+    if ink_bottom is not None:
+        target = max(target, ink_bottom)
+
+    return clamp(target, y_from + 60, y_cap)
+
+
 def find_footer_start_y(page, y_from, y_to):
     ys = []
     for b in page.get_text("blocks"):
@@ -1005,6 +1081,8 @@ def compute_rects_for_pdf(
     number_line_offset: int = 2,
     protect_graph_table_bottom: bool = True,
     ink_bottom_extra: int = 8,
+    protect_vertical_choices: bool = True,
+    vertical_choice_extra: int = 18,
 ):
     """Find crop rectangles for each problem.
 
@@ -1016,6 +1094,8 @@ def compute_rects_for_pdf(
       bottom detection may cut them off. protect_graph_table_bottom scans the whole
       candidate band by raster ink before any text-based shrinking, then keeps the
       bottom at least as low as the lowest ink.
+    - Tall vertical A/B/C/D image-choice problems, such as scatterplots, are protected
+      by extending the crop below D) using the spacing between A/B/C/D labels.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     rects = []
@@ -1071,19 +1151,36 @@ def compute_rects_for_pdf(
             if mcq_last is not None:
                 y_end = clamp(max(y_end, mcq_last + 18), y_start + 60, y_cap)
 
+            vertical_choice_bottom = None
+            if protect_vertical_choices:
+                vertical_choice_bottom = vertical_choice_protection_bottom_y(
+                    page,
+                    y_start,
+                    y_cap,
+                    zoom=zoom,
+                    bottom_extra_px=vertical_choice_extra,
+                )
+                if vertical_choice_bottom is not None:
+                    y_end = clamp(max(y_end, vertical_choice_bottom), y_start + 60, y_cap)
+
             bottom = content_bottom_y(page, y_start, y_end)
             if bottom is not None and bottom > y_start + 80:
                 if mcq_last is not None:
                     bottom = max(bottom, mcq_last + 10)
                 text_based_end = bottom + 14
+                lower_guard = text_based_end
                 if ink_bottom_y is not None:
                     # Never shrink above the lowest visible graph/table ink.
-                    y_end = min(y_end, max(text_based_end, ink_bottom_y))
-                else:
-                    y_end = min(y_end, text_based_end)
+                    lower_guard = max(lower_guard, ink_bottom_y)
+                if vertical_choice_bottom is not None:
+                    # Never shrink above the protected D) graph/scatterplot area.
+                    lower_guard = max(lower_guard, vertical_choice_bottom)
+                y_end = min(y_end, lower_guard)
 
             if ink_bottom_y is not None:
                 y_end = clamp(max(y_end, ink_bottom_y), y_start + 60, y_cap)
+            if vertical_choice_bottom is not None:
+                y_end = clamp(max(y_end, vertical_choice_bottom), y_start + 60, y_cap)
 
             # Last question on a page often needs a little more blank space below.
             if i + 1 == len(anchors):
@@ -1109,6 +1206,8 @@ def compute_rects_for_pdf(
                     new_y_end = max(new_y_end, mcq_last + 12)
                 if ink_bottom_y is not None:
                     new_y_end = max(new_y_end, ink_bottom_y)
+                if vertical_choice_bottom is not None:
+                    new_y_end = max(new_y_end, vertical_choice_bottom)
                 y_end = clamp(new_y_end, y_start + 60, y_cap)
 
             rects.append(
@@ -2254,6 +2353,14 @@ with tab1:
     protect_graph_table_bottom = opt3.checkbox("표/그림 아래쪽 잘림 방지", value=True)
     ink_bottom_extra = opt4.slider("표/그림 아래 여백", 0, 40, 8, 1)
 
+    opt5, opt6 = st.columns(2)
+    protect_vertical_choices = opt5.checkbox(
+        "세로형 A-D 보기 보호",
+        value=True,
+        help="A), B), C), D) 그래프/산점도 보기가 세로로 길게 있을 때 D 보기 아래까지 강제로 포함합니다.",
+    )
+    vertical_choice_extra = opt6.slider("D 보기 아래 여백", 0, 80, 18, 1)
+
     if pdf is not None and st.button("문제별 PNG ZIP 생성", type="primary"):
         try:
             pdf_bytes = pdf.read()
@@ -2270,6 +2377,8 @@ with tab1:
                     number_line_offset=number_line_offset,
                     protect_graph_table_bottom=protect_graph_table_bottom,
                     ink_bottom_extra=ink_bottom_extra,
+                    protect_vertical_choices=protect_vertical_choices,
+                    vertical_choice_extra=vertical_choice_extra,
                 )
 
                 if naming_mode == "전체 1255문항: 표 순서대로 자동 이름 붙이기":
